@@ -16,7 +16,7 @@ from services import fetch_history_batch,fetch_fx_krw_per_usd,fetch_google_news,
 
 st.set_page_config(page_title='HanaV Private Portfolio',page_icon='💠',layout='wide',initial_sidebar_state='expanded')
 st.markdown('''<style>
-/* HanaV Private Portfolio V1.0.3 — refined premium jade theme.
+/* HanaV Private Portfolio V1.0.5 — refined premium jade theme.
    This visual layer intentionally works even if GitHub retains the old dark
    .streamlit/config.toml. No changes to financial calculations or uploads. */
 :root {
@@ -225,6 +225,121 @@ def cached_prices(symbols:tuple[str,...]):
 def cached_news(ticker,name):
     return fetch_google_news(ticker,name)
 
+
+# ---- Symbol-only research adapter. Free data may be incomplete or delayed. ----
+def _numeric(v):
+    try:
+        x=float(v)
+        return x if math.isfinite(x) else None
+    except (TypeError,ValueError,OverflowError):
+        return None
+
+def _amount(v, currency=''):
+    x=_numeric(v)
+    if x is None:return '미제공'
+    unit=currency or ''
+    a=abs(x)
+    if a>=1e12:return f'{x/1e12:,.2f}조 {unit}'
+    if a>=1e8:return f'{x/1e8:,.2f}억 {unit}'
+    if a>=1e4:return f'{x/1e4:,.1f}만 {unit}'
+    return f'{x:,.2f} {unit}'
+
+def _val(v,suffix='',percent_raw=False):
+    x=_numeric(v)
+    return '미제공' if x is None else f'{(x*100 if percent_raw else x):,.2f}{suffix}'
+
+def _income_rows(df):
+    if not isinstance(df,pd.DataFrame) or df.empty:return []
+    labels={'Total Revenue':'매출액','Operating Income':'영업이익','Net Income':'당기순이익','Diluted EPS':'희석EPS'}
+    rows=[]
+    # Financial statement columns typically contain quarter-end timestamps.
+    for dt in sorted(df.columns,reverse=True)[:4]:
+        row={'기간':str(dt)[:10]}
+        for key,korean in labels.items():
+            row[korean]=_numeric(df.loc[key,dt]) if key in df.index else None
+        rows.append(row)
+    return rows
+
+def _estimate_rows(df):
+    if not isinstance(df,pd.DataFrame) or df.empty:return []
+    rows=[]
+    periods={'0q':'이번 분기','+1q':'다음 분기','0y':'올해','+1y':'내년'}
+    for idx in ['0q','+1q','0y','+1y']:
+        if idx in df.index:
+            r=df.loc[idx]
+            rows.append({'기간':periods[idx], '추정EPS':_numeric(r.get('avg')),'분석기관수':_numeric(r.get('numberOfAnalysts')),'EPS 성장률':_numeric(r.get('growth'))})
+    return rows
+
+@st.cache_data(ttl=3600,show_spinner=False,max_entries=100)
+def fetch_selected_research(ticker:str,is_etf:bool=False)->dict:
+    """Fetch only the PUBLIC ticker (no holdings, customer ids, account or costs)."""
+    import yfinance as yf
+    from services import _extract_price_history
+    import re
+    if not re.fullmatch(r'[A-Z0-9^.=\-]{1,25}',ticker.upper()):
+        return {'error':'종목코드 형식이 올바르지 않습니다.','asof':datetime.now().strftime('%Y-%m-%d %H:%M'),'errors':['잘못된 티커']}
+    out={'ticker':ticker,'asof':datetime.now().strftime('%Y-%m-%d %H:%M'),'errors':[],
+         'quote':{},'info':{},'analyst_targets':{},'quarters':[],'eps_estimates':[], 'price_currency':'','financial_currency':''}
+    t=yf.Ticker(ticker)
+    try:
+        history=t.history(period='1y',interval='1d',auto_adjust=False,timeout=16)
+        from services import _extract_price_history
+        out['quote']=_extract_price_history(history)
+        if out['quote']:
+            close=out['quote'].get('history')
+            if isinstance(close,pd.Series) and len(close)>=16:
+                diff=close.diff();up=diff.clip(lower=0).ewm(alpha=1/14,adjust=False).mean()
+                down=(-diff.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
+                d=_numeric(down.iloc[-1]);u=_numeric(up.iloc[-1])
+                if d is not None and u is not None:
+                    out['quote']['rsi14']=100.0 if d==0 and u>0 else (100-(100/(1+(u/d)))) if d>0 else None
+    except Exception as e:out['errors'].append('가격 이력: '+str(e)[:100])
+    try:
+        info=t.get_info() or {}
+        keys=['shortName','longName','currency','financialCurrency','sector','industry','longBusinessSummary',
+              'marketCap','trailingPE','forwardPE','priceToBook','trailingEps','forwardEps',
+              'returnOnEquity','operatingMargins','profitMargins','revenueGrowth','earningsGrowth',
+              'dividendYield','totalAssets','fundFamily','category','numberOfAnalystOpinions','recommendationKey']
+        out['info']={k:info.get(k) for k in keys if info.get(k) is not None}
+        out['price_currency']=str(info.get('currency') or '').upper()
+        out['financial_currency']=str(info.get('financialCurrency') or info.get('currency') or '').upper()
+    except Exception as e:out['errors'].append('기본 지표: '+str(e)[:100])
+    if not is_etf:
+        try:
+            targets=t.get_analyst_price_targets() or {}
+            if isinstance(targets,dict):
+                out['analyst_targets']={k:_numeric(targets.get(k)) for k in ('current','low','mean','median','high')}
+        except Exception as e:out['errors'].append('목표가 집계: '+str(e)[:100])
+        try:out['quarters']=_income_rows(t.get_income_stmt(freq='quarterly'))
+        except Exception as e:out['errors'].append('분기 실적: '+str(e)[:100])
+        try:out['eps_estimates']=_estimate_rows(t.get_earnings_estimate())
+        except Exception as e:out['errors'].append('EPS 추정: '+str(e)[:100])
+    return out
+
+def _evidence_insights(row:pd.Series,market:dict)->list[str]:
+    """Deterministic monitoring commentary; no invented price targets or predictions."""
+    notes=[];q=market.get('quote',{}) or {};info=market.get('info',{}) or {}
+    p=_numeric(q.get('price'));ma20=_numeric(q.get('ma20'));ma60=_numeric(q.get('ma60'))
+    if p is not None and ma20 is not None and ma60 is not None:
+        relative='상회' if p>ma20 else '하회'
+        notes.append(f'최근 종가가 20일 이동평균을 {relative}합니다. 20일선과 60일선은 '+('상승 배열' if ma20>ma60 else '하락 또는 혼조 배열')+'입니다.')
+    if p is not None and _numeric(q.get('high52')):
+        draw=(p/q['high52']-1)*100
+        notes.append(f'최근 1년 종가 고점 대비 {draw:.1f}% 위치입니다. 고점 갱신 여부와 낙폭 확대를 추적합니다.')
+    if _numeric(q.get('ret_1m')) is not None and _numeric(q.get('ret_3m')) is not None:
+        notes.append(f"직전 약 1개월 수익률 {q['ret_1m']:+.1f}%, 약 3개월 수익률 {q['ret_3m']:+.1f}%입니다. (거래일 기준)")
+    rg=_numeric(info.get('revenueGrowth'));eg=_numeric(info.get('earningsGrowth'))
+    if rg is not None:notes.append(f'Yahoo 제공 매출 성장률 {rg*100:+.1f}%입니다. 비교 기간·회계기준을 원문에서 확인해야 합니다.')
+    if eg is not None:notes.append(f'Yahoo 제공 순이익 성장률 {eg*100:+.1f}%입니다. 일회성 요인과 추정치 변동을 점검하세요.')
+    targets=market.get('analyst_targets',{}) or {}
+    tm=_numeric(targets.get('mean'))
+    if tm is not None and p is not None and p>0:
+        valid_ccy=not market.get('price_currency') or market.get('price_currency')==str(row.get('통화','')).upper()
+        if valid_ccy and market.get('price_currency'):notes.append(f'Yahoo 집계 목표가 평균과 최근 종가의 괴리는 {(tm/p-1)*100:+.1f}%입니다. 목표가 발표일과 집계기관을 확인할 수 없어 참고지표로만 사용합니다.')
+    if not notes:notes.append('최신 시장데이터를 충분히 확보하지 못했습니다. 종목코드와 시세 제공 상태를 확인하세요.')
+    notes.append('관리 원칙: 뉴스·실적·가격 추세를 재점검하고, 적정 비중과 관련 ETF 중복 노출은 담당자가 별도 검토합니다.')
+    return notes
+
 @st.cache_data(ttl=1800,show_spinner=False)
 def cached_fx():
     return fetch_fx_krw_per_usd()
@@ -264,6 +379,148 @@ _EMBEDDED_DEMO = (
     'vwG6yvB8'
 )
 
+
+# Embedded template ensures that the Excel download works even if a GitHub
+# commit contains only app.py (no samples directory). Synthetic and blank only.
+_EMBEDDED_XLSX=(
+    'eNqtewVYlFvXNiEhUird3TJ0Nwgq3SjdHcPQXUqXSAmI0tKNdJc0o6A0DN0NIwj/gJ7Xc/xev8N/XR9czFzPs/e6173utffaz+zZKMki3'
+    'sKBg4NDhRvF1tBVl1qxYoKHgzNAgIPDgt11swG42jtaG9nbW7O62do0jjYqtLNho+xqlgm1im1xZUOVwKwshQ3+KanEBWWkXxlNbonT0t'
+    'B1tCnlo4XC02F7My0Eiz3IK0rSMhBMU/D97uTaKP7gjhNaF1rRvc0qBum3Kmm3uZ/sZi2gUJIdejp75Qy45R0RfC5X4im+n6qpTnjfCEx'
+    'CU/FANyDftLUqtrD8ga10RwKylhnI7wlelrxl4iM6HL2lonoXVcpOGpoP7vp1X9uEFVISzReXwWZ7QSMec3yypcGxoQ8T5uJYMUYlyYIM'
+    'X0mTRn87TTH1aR9NDceJchKIfZsPSPQPUJdgTgkfNZLyaZs6H9Nt9G54Ux9sCuKdFK/iZYhmX4ePnNBbdOZ77itWhLe4XTI9YGNvWt/wZ'
+    'TYWSkx4EEyYRVIn3iJ4sQswMfFUKf+ecEGv9A9Z5aBzAoiIcHDN1HBwGD9kBTm525iCrkRdeiYPSmHD/s4c8aEa2b8sTe7R+ocxOUAjTb'
+    'Be2QMbs6AOVP5O6BFpR+6kEqSDguMYybLI26PQRTNkaZvyduhxgDsJ2zoCH4f/i7XXtgh1zq16p/rmc/MXrLWRnf5zuaRdErISEpDJDiR'
+    'Bygzt9pBxQRKPvZCHSXSUe4RYwnejCWaJgB1lNaGqVTEECZYKEcN3GB7dXRORehdSxT2pOo9QT/epvC868g4L+NYz5FoD4s0AezFOIuk2'
+    'SOw3fF1embrijQGmsUkmlVYG/pyPIpm4X28zSI3ylEyEy+jAGbLH4i/IVe7y3b7FvIsWuVD3sesSsdQsCBhpr8kqBt3RWb00ljBR3MQCp'
+    '+lE2THLJqmiRK4kVgWZTs7a5pKazfScU1JkHaJYmGHexX6pR62I2s+Ihjqyf3xA2cb6NmLhHge5l4plXyNiZWrFkZF0gHyXdT0fB8RGwD'
+    'kBSU/+UuK0RwLEtYbpWysGmWqvm48etllzChEVx34g0JGeQcy1MXyB6ZgQTbqfnokk4J/Oa8JQTDBroIecicRkiDemPskg0yfld9v9CW+'
+    '1vg/uRxXBPevJoCl/i6/oqL0phGozvcMbMZ043E4r07uh+gMgEbhCeDdlKUzRk3k0EM2JCLTmFZX0RqNfTP4JQ6tJ8wOkgjUygRy4kucB'
+    'm0OPS7Mpi1PHmW9NRO3NxSvHbltYyyEtP0+nu1gxuQyoRR1bmVGMUzwmwNt9xnC4Fbcb9y3rM9W46ya2PE7dce+5Uu4YZtEjJ/vbfLdkW'
+    'yi12ogCaJ/FrLIbjzN8kQyJ1Htc+fYtk/LRkwVbNOMjWXYyiRynFzGMaZQmH0M9olfjJVQdjuUyOo3yerEbVSyqCKw22dTJ8VUfapR+bk'
+    'ZdC257bzx5FmUhP4VSGvD9jYfo+ZhpTs9Z1zoj11P4/JqA1zVtvGF4bbV4aLkZUN6TDPNUEyVz5P1Iqktg8fM2U7ydVWChvPr7A3MJ9Xj'
+    'Gggu/mRTa/ScGRagM4QG+6oSytQk+bnMB6Wteix/GNEsYu8q1vcNAlyj/nC3fdOCfXs2WCdhUuf9jtjhZmNqa/nhlvy5EmpOOKWw457jS'
+    'Oxi8oIMgk3vdduSjlrm9WD0UYpHYZI+j0pp3KOwQIiBcLpsoskZDXx+ulLaN15ylWpSEAHWGsZM0kYexI8MIwFy3tGO9Dlq3BrhTw9GXH'
+    'mWyyVBqmSh5XX5Hr/RWYEhvxzaRsFmuG8xEX4rRxyWWOuF/jJYg2VqClrDOHigoB05dTTD84IHJjmQ7QyvOnxGQeOeuoeIIfPn+s3OjBN'
+    'HzSAAqWI/ydism+MMX4cxGOCJ/HRbUO/6UomJg++IjnrCQUANaB1pReQPSu81aHDHZGzyjWs8u+jcJaAJC2B3WEmdZM6VaGCQqEzID5Lu'
+    '5vQrgmfOs3Cg855KPKcQMS7vR/T3tB77B31PHMIcQ6yL1oeSSUyh/HiZEmiIc8zY4QaTJJ6rL9Pu6P1iR8B0u9CNqDsD4wwa0abJFW04l'
+    'hhxlz3+DaEYycMegbtRKHYHJI/KE+bFDkMns0q59qwYSbvlHJYP80BqMJwZqPAw0bgOlxyFguUdkfDK7pGId0QiH8OZRa/UIUUrklLZrA'
+    'si60+i13LVJXjT35Xri3KhXY2WBDRR8eoYSi1LSVdlfTO60EbWRsZmWEh8IqH+skm+VNPDr1RkVZ8P9/HqDW1E4Nc72oiJkI4dXW9APhP'
+    'nQtdUBJ92CcJFlKf/FPddyzKE3wyMjGM5f6NdjXB3LsWfPS2Pm8rB1GbFa1QKXGOf7reqX7tIwsN7RoF+NP2KhxTRTdTXxdrFWZGAfMoh'
+    '43dD16uV7s426XfSHGlluF4a04myUWVP5sjhPySfh331PrmaGNi5vX/Sx8ESEo/RUoNEDqlaY1S0Q2qEIRAVTyX0jq+3CUo8DqNjLRuXJ'
+    'a/MqSBrOnzrxM1YjlOWyzFhal5v6GpAgdHOSIlqwL2cw+uEZj1UNnX7P0A42iWud6PXEsn2eCElQvcu8hJ59slK14Fwn0Ac88vnUUpWzO'
+    'Zbicw/gIIL8sTbrVGbO95Mqc4HQSdn7daUleaIiYcqhppgRF12o8wsBm6+jxinj7PzE5/5WGnYX8P+cMxhktaumsCsQ7A/n5wpjYehoaq'
+    'Lq5GhpZ3690CC1KqO1U6DDDRc8ujCfEumKmXjzcKISjQ4vDiO6+STB1hEkSvSsnsbtG1yUyY5MPHPr+GA3SrVzsvLnqUU6IvMAIxcZqek'
+    '7QI1Z+5e9W5uBFe93IBKNKEuSd2KB7Zqo9os6SCTFvv+kBWVCSojGg4MrKYODI/j1PAGyMDV1AgGu367nc1Garv2kjIdMM1qr9fi9TlfK'
+    'faoBrYLkx+WWDYDxSqmnEjTKtGtfJgvgpnHqe9RHHrxGGBz7YqfP8yX87RqrisHZcxuoII7kkGSyKBlmt3jJPVLRy/nVEA4HuX3RnfO5t'
+    'aWHEPCek4tIrYBF9fY2DzGkANLbC/2cGbgMga7po78W/XAyCP5OH7dGX1Gx5zbj5uEO5J709RgWShkqOXF1Mes2h/SNbG4vengdHe4vOH'
+    'E0kgyYu9KDZQQrNtbcnMo/bO4bmdu71tSA+AWarXKQ8A9zVyD0FfElRGv+ZAp06VmA815xkCu7t3AdEa/Pxdy3BS+fYRtu4oPeozMIGOo'
+    'JCQ8PXK73HOhadfO5WDvNHPl8+hbqwJGuyApO5yWugFqIiFi8UaD35Wyy4nHZbqw46Mos8nGuj2vv5N0bqQRyiJAKNyX5Crk7con4OiWQ'
+    'NdRrLa1d7C0aAVv3FjOA7m8WuYkTM3PDL0X4RZPTSbm0v5tBNs8XTbzim6K79iBfvRyhFefmNX0NTV4A/SZXT/edB6z2K32TfX0ndfZAd'
+    '3r9mVrvw2NtnZmBRFd7wKxneJ8ndH/m5GzmDLp/sbUUWPPBKwZA7tVMPsWmL9LQ6HWKl1jjsuVe4VnfMnm++qyPfubEazmb/PMGkl26p6'
+    'f9AURWMX78TsPepnXjAMLxoexlHL6Fva7BynGiw572hvSB8jcjAffRJNYXowAbzyFWvQs0wMUTfgXOnerXkV8XLAVFLQaXwZ3pXh47nTV'
+    'D+l4Hn8NFL+aX0n1iyZbB41jVDZsAaHnKrM/F/sbs7PlOif5FO2fdZuOoKaD5IrUYSFwMXfg6YH8RyfphCL/hW71o07cVfTBSsFdrn/3l'
+    '2fLXgxR9H+i+vs/DxO8O7aaXe/Ups14X++GXXnsD5k5fR5Ahs96gg/ohHh0IL99p7pC9T/ioxN7KwSa0AHAZyxpO3JRd4nu5vpNu+2XyT'
+    'Lu4FgquSLn89rL43KAvviR+yuvIvO60HQP/cgig53XmtRSQ1gnoIG7GX+P19Bmesk70ARzj9eU2S7vapR8RYs4G7YxkeWKA9alqdkVa29'
+    'EF7dvI7wlRra6NILYmAXYab88OlV7SnVO0x/eJesG60QnOVepCKuUVJhdf0emmpN4TsolTDZC5JSzsQUEwuXjdUKnrNPEeOEGZS+r4JK5'
+    'YUuE2mUsPYyt1wBsyYewIUsfrhglGga0xvq2XYFb+7MfjtLm3sOoXX83dFVeMJkPtYuW/btjCSzu2Sj3usYxOHc3aiFUNCBZ2fLIb8jZX'
+    'BuuWcfSPhuMwhTNuhbPFSkUFy9GjXsbWdhF+WjepYXAmSkCZ4o+Gs4e5gUS5iI4CFLlca8gwN/N+qX/FyEfxoyEwA2wYCabkJ32p+tpJE'
+    'ubG4RGM993Dw1V/A5KX1w1gwxHL9bktFfCnOvXMgmfAMVMmo1gyIl318EPU993Ct7JGNLSOrJ3US0fU25Pt1KbyVaYkOh+oyVWwqqrLHQ'
+    '7nMdB5BH2CkCGMWjCHLOAx2b1b0HgKVDfLZlSKePf8qlNEkakajrEt5dGHYD+uCbQMgri+PAZWmfEFfYYa5q5NDqYw9gYO9c4kPemH7F3'
+    '4KtGeqI8yiyjCyloiwhYcA7N9owuUInDNYBDBpvlhZR0RYUY27FlkJ9gx0triOMYxhLidSzTa59o7Lp0EpjAIs6c5+QTt/XkMXVyS60As'
+    'eMtKXCn242RlZR3Wys7w25O4xpkwEy3L5HyjTa7MDAJZjJ9RYncmWUs/BPJ/wQPw2WhG9F65rIS5ZJ+EuUTn/eWy8cqlj3ZDTpUuO16qs'
+    'nIERuJ7pq4wTqawMkiMx5SkGJEtknIEu7kaTiLIbq9tGkbMCUaMThdGLHMQRqzwF7HqNBix4vrG/DpZ1d1viGOkg3VyR7SohYKZ+1S3xk'
+    'j/UqNEymCaMH6c6qNzjduac70RrD2DYONKXGeYG+PpX+JuwBywjk8vLO1thUHVuXwII/VlIPijp/FcPoyR+rIQfPDpZy4f/kh9RQj+p1P'
+    'cKsdp2ircsLJtWIyF9XLq7GMwQhHOwX9l9NrTBx1XS/sbdArnNbTV/MnoKlfX/QV/CTd9JVydLLMmQ1fdlVrbsLRrucKk+RXotdGC43Q2'
+    'N9OP/lqusET9CBfzP4m6MgLWbo86Pf93JfTUp6/GonNwxZ876dbnb49+qjPK3NdggAV4NKAE87C0BXt9JLxNSRFZHdBAj7YxuJq/IMfLV'
+    'Jxfz4UE4+kw9r/E2CDxU6SrofEj2F9D44qEvXu7ybQgHfRB3Pmbxz5gmmbrl7M8vTspi7wK+4L00KK485nHPgc0zZ4vZ0WeFte73DQKHJ'
+    'i27U//5DVxo1hX3dUSDWY9X9inhvtT4r+i/JGXPufxm8RorflZ9zUCzJpv4895rCpYZ5X3h1mnOv85jwLqzok5Y7jE8VimBrCBQ97XAqN'
+    'B3t9S99c8WQQTwrpq4prXKQNvIkTuTYRQ/VcharwEirchwHMo34Ufia9ElChVd3osBKt3L3fx1NjxnJ//4i2Jr0qUKFN3ejzz/5lXmPzv'
+    'byD/htoN5HfOv4H8dX/JHx18NW/JsbvrOOvyCdbu/oWWfv/6Dh84Mqzgpnhi7Ne17I+1Yvqq4r2FWZtflcWrvHXV/SqLYz/Kot2/JnvGk'
+    'flVnee73QGlUzsGL0GcJnK0WeznOyFtNVLznhm78sqnxQxe2jhNALRZguz/M6+wIVZzk2Rr3yTZBbBkVxV/yZvKQ4PVsUZ13LG0EfXOR9'
+    'F/odUa/7gDW3x1bor3r4NH/QaD5+gmg8fjX5Pt1ucN2LDz6nVtWtTW328EQJcTvU5km77Tzl6+tPfrdW1Z1DbYF2aD0iV54ff/n3mFDbH'
+    'GmyTbB5bs986d0ksJtbClJswoKxhWZ6iFJf6qPDO1/1+Vp/kmw0L/JmksuUkab1KCj/51zu4lSGKuK/DPGWOepiKKrPopCsxlYp4WIops'
+    '+ikKzkEwTxsQRXb9FIXmqLE+/h8Sw7jKdBEzD1OwK6zsM4VdP3VG/OepM0ZVqHQ7ophp0Clz4SaZFL9Bfqbf3iA/dko3yA9v3g1kIFa7q'
+    'Qz/kp/7W+tRlRDOrVMlQZHPUdFVENDWqYGgyNeo6GpIxdapg6DIdFR0DeRg6+MNiWnAiD3TtFGLuttR16eGQy3M9Y+Kv3LbaJpQVz11Tb'
+    'rzJjOt/Sb5MbxJfkpvkh+tm+Sn8KYy/Gt+bjB/IH0bg4AVxH7oLZBIW+oQ24pkPxQHJNKVOsS+EtgPpQGJfEwd4lhp769JM9NzT4W+OOj'
+    'nJbFompc6wJB5bc8H9mp/t0yswD3rUAh9ARrgJbFpmjeBNaXY80169c0v1zvnpuSycwyupEAqORvMUqP5eAu7oDGgjjeu9wi6l6isUhUF'
+    'YHdqUp2btF2/uBNRQ7ym+BUE2627oB2gdqvUISGZTXd6f6AOa0YXdA52x6tvZKXe2Tz9CjQ3/QcoltgVKKrTL9Ah8WvQIBgojscVKIHAD'
+    '1AhJxiootTfQLWcrkBbV+ud6TOvQM0zfzKVuQL1+xuo4uNr0DgYqNI1qNpP0Mor0CHZv4EOX4OWrdU7r+RcgdLn/mSqeAV6+nemStegGT'
+    'DQiGvQmJ+gLM5XTFX/BvrI+Qr03TpM0/xrTfN/MtW4AnVw/htTrStQLvOCYn4wAQEvSxdwglADEoKVqBVBLWL0E5GqCyMc2G4kBBno2nj'
+    'NGRkLtFNIdXkxHgECEWlAplJDhHdo2KL6Hn7i48015G7K5td2Hkju6uHjpb/mV8uPUQCz+OUzBVxKNDuaWlS3LGdskppyPzdtnhsG8+Iz'
+    'zMJoSPB2BMTxLvfggKVWpL3loIYuKAcWwUAoeHD3NQwGFmrK/bKVtFtdwNoQopVlrl/0CVeWOyzN3QauacAsvhwoIEA+6EhFXvPUfl2hP'
+    'p5qGQFjvXAtxhWNlWWp/6h2xXPvwcDXfOtBLmnYFUwJPc5rGiAQ1XFDXAsfK77yNc/ThGU5rGfGPxH6/+yRszef/SeC2Z891mrCeKFHEO'
+    'NB+LbQC4AdwbIsXXfJ2X+6vAt50fnBkP3Nnhnk32XtXp5yrxMVJI5eseMiz56PG/E6BI90QnstfERqX3NH0UeXLKMMuIC+YxEfpOtHY73'
+    'GX6lwr2A/21g7PXy7dnyMLwI+XDPxgJ4afaobjxD12I1tvu972NJ4punqs/82mcwZmrsW/vn5Btn6xcyFt1tetK/LCj3W1OWQZFDj99IL'
+    'bN7LbyspgKY60GV3sOv25Wm7IODyOxbvrHDzwUK9vd73LfNJcleMgdH18UwZCJY0WGZFs6Kr89TJZ3iqcdKeJ6ckfT/8Ml2xGP9y3JaHT'
+    'GH5oDfb25mHLC0id63ApQIokNyfqM/ic34w0h6+J5O55gVt9/qO8cDduM7Xx3H43K1mWkSE9JhcZNP5RCCz0bBi73B/wapaVNjizcDK+J'
+    'mgYAWkYm/JwsXVUbjJw8M9tmloxMvFlcO7kpNfWFiUrL53D9K399nrerOWk1S/4QJzaLDE/Liwfnpwoe9q/zecfq7xEvGfm9iS2bqvm+H'
+    'h4JBv/Wdv3cnQyMYU9OPtegPbGTxthcOOg7KrSei4MxhcNZYNpkJ69/ZhIQDblSNNTOQFDURhx2MEN1vTKJxZbkPlmRU+AG8cD8n73eNj'
+    'UhPz+hHbgS1fH/q4uLjC4sRXbiWxMUkVBEFFcG4hzm4BXxXQ0eJntOE3rAtMtVs1b7nzhYqjCiEzhrWCWNU+3l5OYQF86mOE0wswVZjbT'
+    'tBGfdU1B/wyg5aJ7UYYcPsewM01EF+Ou4C5mCLWN3Mu3UIQojsmRUsrV91HYPJkyXY2MQ1dmUFbSKYwi2YpQIJWW2fzlAMflY5D8pHygo'
+    'x46aZqCGGpt62DihJd4+AAWYKd7zObBjKs9RGg95G6/g7i0GV65PJY6vHh7ui5yCdypuDGZouj0hU/WTwyteXFqXdk/Z8XBz4vgt9JPhi'
+    'KJ/Pl/dzSsLUxtENy/K4K33w5Kxer6VOmcLBuWfChscng8dRurO2y8VBq3TPMQG2Upxh036nxq++Ptvf1nn38fsBWRz3gbNp0pDsz2PPt'
+    'qe/yaWJBh4Ls5VRJd+ALaDj+4JhtgW4Az9OP9k9e544GDSkF3CGCVzRrOLt1571Z1QBxkpnifJrFN4VXLfwvB7LTpDkNwQaGvNa+cP9MO'
+    'H5WJ/s2Ehwc7d0/fmvBcZX0yKRJ1QktgpbLePv9UfyEAi3nJ4Ia1lsfpq22lpLj8/oRgBINQpuIzsbBSIIT6glzdKwuZXlVYJxS+dzTUV'
+    'H6lb7LUtBLuAkyLkUa/cGtk2msmu3CbNXStvCvWTGhQErfGEQRTnqal8nPCWpYBi65OqZrva1tTdSxfftY9xtuWa+p0QmW40HwaC0tabB'
+    '7Bh/sr7mNAVj2kqucrPSwwUDGDfyO52Iujxchtz2fCeCiogQG+jsJJc+vBlQ7tZEJPZAISI8G5GZ1t63TpOtovTLSYfgo7oeZel/l6Qn+'
+    '6GOPR5ije9xnrtzJMXjGOnxtrUYcsXOc7Kw9rVOOGvdGh9Ls381wDB6WCgpPpZGhSZekkK+mtYucuumEgfGVtZBGyKSGSKJc6FwZbcb4B'
+    'cy4OsR5uh5mkDxiZ2UOPc6Nn4zbkzsnlAvvjf/Q0V5J8eRAgomxZUfs9QO1glOzwFQSxATeHv8nLmotKm8Ka1ZjNVIDnWs+TE5SDeNGlQ'
+    'VBWOaFExwCaBuG7ino3UO2WdIZVv4SHtUW4bxTHmTMMs8n6xZNm2pwe6ciKG6e+T0ySf6jRaZ8ePPQ+R0W+3iTfma/M+Isj57KXE6gwVx'
+    '9aJTsHJT1q7I3KW8v8+KsqHKffwWLblUSfedr8v4hZINOONXLcB/XY0TVodi2d+oq/lwuyvFlDZHlaDnvIBfv1VWUeBzsx33XdETnZBrn'
+    'ZM7m7O0yxrb5eVQRR0SILBoQR3uMp/2IE9s7XtTDa6kVBYivp/idTZoUBFilkOT5TfDjDQqEidNGP4zHcYF3brfRAO58yK0uaEVp9MMqb'
+    'x2oODFpRMIv6jEhN6lACRyZfwRLtAxBloO9IvzBzup9pEqo53J95R2DWlPPni5mlk+FAfAMBVqfGiRmDxG8D6xWM8LObMybe7vSPLgEv8'
+    'MhsB1ZuHg5IXMTlj4rZ6K1FsVa/soIpdHOhhQ/HHItU6LulAx77PR8M09LTRCkS563sopGJuzVc+cAOyXZi62/4qT4dlK/pM2y/pvI6G8'
+    'GTk7fzMmFUtPcFgKTkwknF7Zfaih3l3A7fmky0WexPyFpsdHQte1+M6i3uM2wYbVtCJhq97aZLnxdt0wQHCo8RZ8fzu1YDm/CGdzJxFfQ'
+    'kldy4FRzxrW8msEISTxxiShJX5gp04x7EaD3ZZUhRxmQpe1yF/M4VHvUJtYIoxC/jrjUR6xIXmTk1XRbmP9lVVkefNNUFrS+bsvMpZzWt'
+    'egZUq7RoufTTaKxGPoxJfIxj4FBDJmcN2fHyQkvng1+AtlsYhNPeribqbu8t375TWSgKoHKWHglxBKXg7ibK1/weS5x3/RWHrj+YTgyJ5'
+    'OMlHWmGRzZ6thMju5uMa/HlziqNm+reO9nPK5JA1t0De+7h7zT8rwFBLdd0wWrL8xTrFrzGT4UG7unrK+sbboZrO+BtPPI3o05wjdK2zE'
+    'shHK10XXuIzd9PT0m/Jyf/epLR6zIfMGizGZWPa1x5lIgiqKXQbximVK7C+alnTgciQ35lCfHPOL+MU4kE8bSRoiQ81MnHHCoYlTRuJV+'
+    'zRbYeKS9l8lHeaqpJ/+VEqdFvQnPIFAx17Ib+FR0jh6XGE3Dole5aJwpcv0BYeFoLLQKPOuuoPDmGZNAWLK7My43YgHt6CZIchWsVBv6u'
+    'beFa+jjqVkc136C0Slcn8DIYNm70zz43mCer9BHmFwrFbpBdSFHJDEeM8Tvc8nCotYTX8i6T77jeh45kevLkWKeU9xWSLO/58TE2Kr1RE'
+    'vhS1WFVnv+BCOHXcbsbM67x5NRCpnfEOmLRF1AqqcS4Jc1XovvkzMyk5SfqZUVQmbY+XS5tOG9BZhUh+bJAQZs68f9g/dcug+f0NPLHKJ'
+    'UJdBu4LPeLbZb7SoXH4uPSigsUi0w0NJ+QMT2JDLHmqU3S6uWSROpqV461x3oTw5RHcSoP0OmElWMZ5MAGA5ubez3ZJ8iXLKxstJwPn20'
+    'd6ASceebvSOFQFhlOq1hr0+Y424BxWOJuoPqnu77DY9mqUj67wR88ga6rF9AgGe/fbOtXaS4Qgp7IPiI/cc1gvNqjUhL0gZNSOP4XX4cb'
+    'BpH1d01ZeGICgWUUbpM0Q2hsbwNzTLN4s7xdiSeAn6UnGR8M0y4yREqaCu09arLhS4ZeIn97EJSBoE6KNpmkd6p8CBNdws6VqjlpcSJoU'
+    'Zbnakq29lLCE9ttGQpXvOEaca0E7C8G3hoZGsYPQFI46BE/yzX7ohnxcTKqfH0EU2qV3LSa05J5o78ZOnYiZyuVEKrxHsKnXTPWrvlqCn'
+    'RJJgMreqeNwZc6KevmQzdfthDvIqUDWg0aHxr1DpUbIEnrr+jhp72ni/0bma8vIpJXwebWgONUdZSsh6t9uuHaucBHNLyOyLSmGACZeBI'
+    'ziz2nUwpD3Z2nmd8aGblC6IdCZFoWXlbRJuM09rUHu83MYpP1a3uuFudir0h6vnU2Nne88nqYuWNnoEpLr05O9PGc4SyhhUxqG6w8gF0V'
+    '0/JzC9cUgd9Vw1dh2hhFBU/nuCDUMeSgRMjcjE6kLalk8DNKiR3+2SzQtKLp2XFaA4k6bXtE5lCvnAAL0KOqIg2PoMq7s9XJBvVUZ/rrl'
+    'eAjIRw0sG3daBGiENQASDMbanymeks9XMy95cqvf1dN2UkaRmJZ1qyOn3RVsvyVnR16SWAdmeJhZbd8Vy+XW2TbbJZVf5kULBxG7izDzg'
+    'xnibOESCwCRIOYr84bhH2HLq0rmuupLSB8vQLC/olyd0CWxzEzVLO3UU/bG7evJwI8sMlcBgCuNW3Y2lv25dQ2nAjnEFepZN8iBT1nPZG'
+    '1Q7X2lPU9akjby2UKWxNQbzA06nsrjnOnV6riaKwoV6IHZw58bWT6bc9wHzha3OA9SCkf0YcMyGIXF/cgRXhQmcnzVVCrG0W2/hMggSsf'
+    '6tTRvbtYYZolhBvK2oAB+D22524JairZsMFYOcTtFfx7WZcS1dcWpHz8D5xsmJ6oCMWXRGqz7e5VWV5eiT41F2mpDQVqtHxgEMpio3F/i'
+    'm7vu9lg6I6fjkzWhkwECD6BGMUVgVhWPk7BtfMomnvi3XtDu3ghpGmaUzLfkzGKFKVV6QSTEiT7E99zDN9Py1049tBuC/ncQ4lX09gWT4'
+    'RpRnGQhpDlMOjpfyIdXtfMmwpmKuRXKUnWukVxkP+tQufHmOfnlJyLHFRky/RUxXoq+B9E+BFzppPcf0AnShCcxxnXIum4FsCXjDHWwKO'
+    'TxuogEWCe0W9MTiOLIyLa9kxkipBGTYMH3tPEiUI4yT8s7WQs5UMGKtrasTp6axLtNUXFhnDeoYYwIzv5N4HIVQRwugjgXD53OX9XyWlx'
+    'p8N5c4szc68nyttn/XPDeiO688EaIoxSwPKmnDfMRCHOfJOuOfijpd8Gu/eC9OgejrAupYQiK5iwoRnZsZejhIMvHw9EuabbcDl5t4c9V'
+    'GKGXsynCYi7FW5MhvfZbRPwqNLrL9KCtx1SeG9O36LAfY54+rvDuyevqOpDQjAevW6U98sJAqrJhQupo4gS3s7YSp2VjYqClM7Y3sTSzt'
+    'zYSpnJ7MHfFSiIkIqpjaGTrAeIAtLBxAFzMQOJExl4eTkIAAAgIwtTG0NQaz2DqZ2sBYze0dbQyfYpaM5wMHQ2NrQ3BTAwcbGA3D8OwbV'
+    'PzEp1NwdTG+CaG9mZmlsKmVv7Gxrauf0X4B/60FFoWboaG7qJEwF+O3UMRXFYxNhKhUTbi5jbiNDTm4eE04udm5+KgqAiBDgH/GK/LNGk'
+    '1EriXHAxGSD1WmiHzX6h6Z/R7/WdwAsqtDOhoO8WyA1E7rVATX+VHnnjvUaEskZfyjRZOyWhAcPclQHLjbOu1vspWrr+y92Hqf7+Lyc1Z'
+    '/lqf8a0ct5ysY3SfH63iu/eAWMauthxvV6oq3qFOEIKszBFz5JEhwpIy+Qj9gVTghQvgbepXS+/+VrxIQ7tdGjtJ1dmkVlJz9OiSebiaQ'
+    'W08kkg/fPc0cshR+5OeybtHSJhgFDVu4iPMFsc8UmDlrZE5Q158xYVOa2ANxRIFxKvldlRghQDihBDhMm0PJsyujLuoPLmGQTXp6vNs3R'
+    'tW+dLwEQystdRZn83jTmWDVn+ZRJDyfMn4VQzFN+Jvygexixg3uL/sILTkxHr4QmnsVJfVzHUfqxD2KDTWumBDZakPkr1ZzbU3AA/V2pG'
+    'aYYoo/5oyz2AKGGbyeTWP9U2nHPJL4OdkUDU5v6f6yGP0T/ddrrWvLIIcGoNjac5/NFWjXpU9hknG/5uLgqQzD4lgXKdmWrxc1scVhCHy'
+    'iJwd/rrFxJFFmbKqlx0S00NA977NltqPK5peex77DdnMPH9RWsMd16auryY9ZIARqNQmBoexJIi5KO/yXu+31/nTJpqMVDhfhoRGTKaCM'
+    'Km3UP/71pP8W4LYD/BbVHdmVWZCK9LKuvP3v4DHZpYwiiKaZWP8gj/rF6IXy1sMOXz+D3an2zTfr9KckWCS2l1nsQ65PfPiwGRclzPYCF'
+    'vXzrx2lVbUl7OyfYeNa/migg3at4O19NP0Fkx36ub9pbxGXJHPKoplHJXn0Yn6Ciov4dlJqzaNL8oE1mHzfrKaNKUPaHzpTUlF7XwWQxk'
+    'VlRvILBr0bhoXK72Um97xmGN5QIZ18ZtR8tPitMCE/UlWISMBeOzzCN4n0SazcC34s94jo4Rslv8JKSmylATzLQSiRNj5FUKHPl9g6hUe'
+    '2HdiKehPCzqJGT6rSKjA9bK8ca2X4ERSMtdG5VR59je2k+VY1oITUCV5+qyKHiVoVsFvYzkRL4xrauaw4FJShwfrejvT8hJFkU6lTqNmX'
+    '0JKdt4fY9Ub92lbxBpoW0hy+pefuHKa3tRgx9By9IKIyR+6pjSj2WTbw4PVbSN99R2FMWHTxUeWpGHcy/izILp/dABWAc3DOsyst+WSJP'
+    'glIr5Ikd71u0hK8kC4+Ag/jnf0n46yfLH+5//oPC78a/H7z/ZawJ/9sx/N9Nfz+F/Mv0+a3/eib5d4Dfj2T+AqhF+e8HNH9H+P305C8EJ'
+    'dQ/n6X8HeX37atfKLjk/30z63eE3/dDfiEgU/55d+R3lN+fmH+hMNH/+fn5F8p/XyR/oXgz/2PJ/N3974vBL8NBlv9tafgd5/dS9wuHj/'
+    'VGhe93wN8LyC9ATsB/LSdKskjIVx3QYb9UsBEay3Z19f8AfbmWYg=='
+)
+
+@st.cache_data(show_spinner=False)
+def portfolio_template_bytes() -> bytes:
+    path=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'samples', 'HanaV_Private_Portfolio_보유종목_입력양식.xlsx')
+    if os.path.isfile(path):
+        try:
+            with open(path,'rb') as f:return f.read()
+        except OSError:pass
+    return zlib.decompress(base64.b64decode(_EMBEDDED_XLSX))
+
 @st.cache_data(show_spinner=False)
 def load_demo():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'samples', 'demo_65.csv')
@@ -285,18 +542,21 @@ st.session_state.setdefault('upload_rev',0)
 st.session_state.setdefault('editor_rev',0)
 st.session_state.setdefault('quotes',{})
 st.session_state.setdefault('news_map',{})
+st.session_state.setdefault('deep_research',{})
 st.session_state.setdefault('fx_val',1350.0)  # 가상 65종목 시연 전용; 실제 업로드 시 0으로 초기화
 st.session_state.setdefault('fx_source','가상 환율' if st.session_state['is_demo'] else '입력 없음')
 
 with st.sidebar:
     st.markdown('## 💠 HanaV Private')
-    st.caption('Portfolio Intelligence | V1.0.3')
+    st.caption('Portfolio Intelligence | V1.0.5')
     if st.button('로그아웃',use_container_width=True):
         # Completely clear current browser session's customer-position data.
         st.session_state.clear()
         st.rerun()
     st.divider()
     st.markdown('#### 1. 보유현황 불러오기')
+    st.download_button('📥 보유종목 엑셀 양식 다운로드',data=portfolio_template_bytes(),file_name='HanaV_Private_Portfolio_보유종목_입력양식.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
+    st.caption('첫 번째 시트에 입력하세요 · 종목코드 앞자리 0 보존')
     uploaded=st.file_uploader('고객별 보유종목 파일',type=['xlsx','csv'],key=f"input_upload_{st.session_state['upload_rev']}",help='계좌번호/주민등록번호 없이 고객별칭, 종목코드, 수량을 입력하세요.')
     if uploaded is not None:
         b=uploaded.getvalue();fingerprint=hashlib.sha256(b).hexdigest()
@@ -314,6 +574,8 @@ with st.sidebar:
                 st.session_state['editor_rev']+=1
                 st.session_state['quote_errors']=[]
                 st.session_state['news_map']={}
+                st.session_state['deep_research']={}
+                st.session_state.pop('selected_research_index',None)
                 st.session_state['fx_val']=0.0
                 st.session_state['fx_source']='입력 없음'
                 st.session_state.pop('pdf_bytes',None)
@@ -329,6 +591,8 @@ with st.sidebar:
         st.session_state['quote_errors']=[]
         st.session_state['quotes']={}
         st.session_state['news_map']={}
+        st.session_state['deep_research']={}
+        st.session_state.pop('selected_research_index',None)
         st.session_state['fx_val']=1350.0
         st.session_state['fx_source']='가상 환율'
         st.session_state.pop('pdf_bytes',None)
@@ -437,6 +701,7 @@ with tab_dashboard:
 
 with tab_holdings:
     st.subheader('보유종목 입력 · 수정')
+    st.download_button('⬇ 엑셀 입력양식 다운로드',data=portfolio_template_bytes(),file_name='HanaV_Private_Portfolio_보유종목_입력양식.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
     st.caption('아래 표는 원본 전체 고객군의 데이터입니다. 편집 후 자동으로 재분석됩니다. 계좌번호와 실명은 넣지 마세요.')
     with st.expander('엑셀 양식 안내 / 입력예시',expanded=False):
         st.write('필수: 종목코드, 보유수량. 권장: 고객구분, 종목명, 시장(KOSPI/KOSDAQ/US), 통화(KRW/USD), 매입단가, 기준가, 업종, 종목유형(주식/ETF). 목표가는 출처와 기준일을 함께 입력하세요.')
@@ -461,47 +726,133 @@ with tab_holdings:
     st.download_button('⬇ 분석 결과 CSV 다운로드',data=to_csv_bytes(positions.drop(columns=['환산율'])),file_name=f'hanav_portfolio_{datetime.now():%Y%m%d}.csv',mime='text/csv')
 
 with tab_research:
-    st.subheader('종목별 심층 분석')
+    st.subheader('🔎 종목별 심층분석 · 실제 시장데이터 연동')
+    st.caption('종목을 고른 뒤 분석 버튼을 누르면 공개 데이터로 종가·기술지표·주요 재무·분기 실적·EPS 추정·목표가 집계·뉴스를 확인합니다. 종목별 제공 범위는 다릅니다.')
     pos_options=[f"{i} | {r['고객구분']} · {str(r['종목명']) or r['종목코드']} ({r['종목코드']})" for i,r in positions.iterrows()]
-    picked=st.selectbox('분석할 종목 선택',list(range(len(pos_options))),format_func=lambda i:pos_options[i])
+    picked=st.selectbox('분석할 종목 선택',list(range(len(pos_options))),format_func=lambda i:pos_options[i],key='selected_research_index')
     row=positions.iloc[picked]
-    met=st.columns(4)
-    met[0].metric('현재가 / 입력 기준가',f"{row['현재가']:,.2f} {row['통화']}" if pd.notna(row['현재가']) else '가격 없음')
-    met[1].metric('보유 수익률',f"{row['수익률(%)']:+.2f}%" if pd.notna(row['수익률(%)']) else '단가 미입력')
-    met[2].metric('포트폴리오 비중',f"{row['평가액비중(%)']:.2f}%" if pd.notna(row['평가액비중(%)']) else '산출 불가')
-    met[3].metric('52주 종가 고점 대비',f"{row['52주고점대비(%)']:+.1f}%" if pd.notna(row['52주고점대비(%)']) else '이력 없음')
-    d1,d2=st.columns([1.5,1])
-    with d1:
-        st.markdown('#### 1년간 가격 추이')
-        q=use_quotes.get(row['티커'],{})
-        hist=q.get('history',pd.Series(dtype=float))
-        if isinstance(hist,pd.Series) and not hist.empty:
-            fig=go.Figure()
-            fig.add_trace(go.Scatter(x=hist.index,y=hist.values,mode='lines',name='종가',line=dict(color='#13C58C',width=2)))
-            for days,name,color in [(20,'MA20','#EDC878'),(60,'MA60','#85B5FB'),(120,'MA120','#B79AEF')]:
-                if len(hist)>=days:fig.add_trace(go.Scatter(x=hist.index,y=hist.rolling(days).mean(),name=name,line=dict(color=color,width=1.2)))
-            fig.update_layout(height=420,paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)',font_color='#F1FFF7',margin=dict(l=0,r=0,t=0,b=0))
-            st.plotly_chart(fig,use_container_width=True)
-        else:st.info('시세 갱신을 누르면 공개 데이터가 제공되는 종목은 이동평균 차트를 확인할 수 있습니다.')
-    with d2:
-        st.markdown('#### 모니터링 의견')
-        for note in build_individual_note(row):st.markdown('• '+note)
-        st.caption(f"가격출처: {row['가격출처'] or '없음'} · 기준: {row['가격기준일'] or '없음'}")
-    st.markdown('#### 투자판단을 위한 검증자료')
-    if pd.notna(row['목표가']) and row['목표가']>0:
-        st.info(f"입력 목표가: {row['목표가']:,.2f} {row['통화']} / 출처: {row['목표가출처'] or '미입력'} / 발표일: {row['목표가기준일'] or '미입력'}")
+    symbol=str(row['티커'])
+    is_etf='ETF' in str(row.get('종목유형','')).upper()
+    col_refresh,col_news=st.columns([2,1])
+    with col_refresh:
+        if st.button('📡 종합분석 실행: 시세 · 실적 · 목표가 · 뉴스',type='primary',use_container_width=True):
+            with st.spinner(f'{symbol} 공개 시장데이터 조회 중 — 종목코드 외 고객정보는 전송하지 않습니다'):
+                result=fetch_selected_research(symbol,is_etf)
+            st.session_state['deep_research'][symbol]=result
+            articles,msg=cached_news(symbol,str(row['종목명']))
+            st.session_state['news_map'][symbol]=articles
+            st.session_state['news_msg']=msg
+            if result.get('quote'):
+                st.session_state['quotes'][symbol]=result['quote']
+            st.session_state['research_refreshed']=symbol
+            st.rerun()
+    with col_news:
+        if st.button('📰 최신 뉴스 조회',use_container_width=True,key='deep_news'):
+            items,msg=cached_news(symbol,str(row['종목명']))
+            st.session_state['news_map'][symbol]=items
+            st.session_state['news_msg']=msg
+            st.rerun()
+    research=st.session_state.get('deep_research',{}).get(symbol,{})
+    quote=research.get('quote') or st.session_state.get('quotes',{}).get(symbol,{})
+    info=research.get('info',{}) or {}
+    price=_numeric(quote.get('price')) if quote else None
+    if research:
+        st.success(f"{symbol} 시장데이터 요청 시각: {research.get('asof','')} · 공개 데이터(지연/누락 가능)")
+        if research.get('errors'):
+            with st.expander(f"일부 자료 조회 실패 · {len(research['errors'])}건"):
+                for message in research['errors']:st.write('• '+str(message))
     else:
-        st.info('공식 목표주가·컨센서스는 **검증한 자료만** 입력하세요. V1은 외부 목표주가 자동수집을 하지 않습니다.')
-    if st.button('이 종목 최신 뉴스 조회',key='selected_news'):
-        items,msg=cached_news(str(row['티커']),str(row['종목명']))
-        st.session_state['news_map'][str(row['티커'])]=items
-        st.session_state['news_msg']=msg
-    for article in st.session_state['news_map'].get(str(row['티커']),[]):
-        st.markdown(f"**[{article['제목']}]({article['원문']})**")
-        st.caption(f"{article['언론사']} · {article['발행일']}")
-    if str(row['티커']) in st.session_state['news_map'] and not st.session_state['news_map'][str(row['티커'])]:
-        st.warning(st.session_state.get('news_msg','조회 결과 없음'))
-    st.caption('뉴스는 Google News RSS의 공개 검색결과입니다. 동일명 타기업 등 오탐이 가능하며 원문 확인이 필요합니다.')
+        st.info('아직 시장데이터를 조회하지 않았습니다. 위의 **시세 · 실적 · 목표가 조회** 버튼을 눌러주세요. 파일 입력 기준가와 실시간 시세는 구분됩니다.')
+    metrics=st.columns(5)
+    metrics[0].metric('최근 공개 종가',f'{price:,.2f} {row["통화"]}' if price is not None else '미조회')
+    metrics[1].metric('1개월 등락률',_val(quote.get('ret_1m'),'%' ) if quote else '미조회')
+    metrics[2].metric('3개월 등락률',_val(quote.get('ret_3m'),'%' ) if quote else '미조회')
+    metrics[3].metric('보유 수익률',f"{row['수익률(%)']:+.2f}%" if pd.notna(row['수익률(%)']) else '매입가 필요')
+    metrics[4].metric('평가액 비중',f"{row['평가액비중(%)']:.2f}%" if pd.notna(row['평가액비중(%)']) else '평가 불가')
+    st.caption(f"공개 종가 기준일: {quote.get('date','미조회') if quote else '미조회'} · 출처: {quote.get('source','없음') if quote else '없음'} · 수익률/비중은 현재 선택된 평가 기준으로 계산됩니다.")
+    ta,fun,ta_target,news_tab,monitor=st.tabs(['📈 주가 · 기술지표','📊 재무 · 실적','🎯 목표가 · 추정','📰 최근 뉴스','🧭 관리 전략'])
+    with ta:
+        d1,d2=st.columns([1.7,1])
+        with d1:
+            st.markdown('#### 최근 1년 가격 추이')
+            hist=quote.get('history',pd.Series(dtype=float)) if quote else pd.Series(dtype=float)
+            if isinstance(hist,pd.Series) and not hist.empty:
+                fig=go.Figure()
+                fig.add_trace(go.Scatter(x=hist.index,y=hist.values,mode='lines',name='종가',line=dict(color='#55F0BC',width=2.5)))
+                for days,name,color in [(20,'MA20','#EEC978'),(60,'MA60','#92BAFA'),(120,'MA120','#D1A9EA')]:
+                    if len(hist)>=days:fig.add_trace(go.Scatter(x=hist.index,y=hist.rolling(days).mean(),name=name,line=dict(color=color,width=1.3)))
+                fig.update_layout(height=440,paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)',font_color='#F1FFF7',margin=dict(l=0,r=0,t=0,b=0),legend=dict(orientation='h',y=1.08))
+                st.plotly_chart(fig,use_container_width=True)
+            else:st.info('가격 차트는 해당 종목의 시장데이터 조회가 성공하면 표시됩니다.')
+        with d2:
+            st.markdown('#### 기술지표 요약')
+            indicators=[('20일 이동평균',quote.get('ma20')),('60일 이동평균',quote.get('ma60')),('120일 이동평균',quote.get('ma120')),('52주 종가 최고',quote.get('high52')),('RSI(14)',quote.get('rsi14'))] if quote else []
+            if indicators:
+                st.dataframe(pd.DataFrame([{'지표':k,'값':_val(v)} for k,v in indicators]),hide_index=True,use_container_width=True)
+                if price is not None and _numeric(quote.get('high52')):
+                    st.metric('52주 종가 고점 대비',f"{(price/quote['high52']-1)*100:+.1f}%")
+            else:st.info('시세를 조회하면 이동평균·RSI가 표시됩니다.')
+            st.caption('RSI는 14일 종가 변화의 지수평활 평균으로 계산합니다. 52주 고점은 일중 최고가가 아닌 조회 기간 종가의 최고치입니다.')
+    with fun:
+        st.markdown('#### 기업 재무 핵심지표')
+        if not research:st.info('상단의 종합분석 실행 버튼을 눌러주세요.')
+        else:
+            info_cols=st.columns(4)
+            items=[('시가총액',_amount(info.get('marketCap'),research.get('price_currency',''))),
+                   ('PER (TTM)',_val(info.get('trailingPE'))),('예상 PER',_val(info.get('forwardPE'))),('PBR',_val(info.get('priceToBook'))),
+                   ('ROE',_val(info.get('returnOnEquity'),'%',True)),('영업이익률',_val(info.get('operatingMargins'),'%',True)),
+                   ('매출 성장률',_val(info.get('revenueGrowth'),'%',True)),('순이익 성장률',_val(info.get('earningsGrowth'),'%',True))]
+            for i,(label,value) in enumerate(items):info_cols[i%4].metric(label,value)
+            st.caption(f"Yahoo Finance 기본 통계 · {info.get('longName') or info.get('shortName') or symbol} · 주가통화 {research.get('price_currency','확인 불가')} / 실적통화 {research.get('financial_currency','확인 불가')}")
+            st.markdown('#### 최근 분기 손익계산서')
+            rows=research.get('quarters',[])
+            if rows:
+                financial_ccy=research.get('financial_currency','')
+                frame=pd.DataFrame([{'분기':q['기간'], '매출액':_amount(q.get('매출액'),financial_ccy), '영업이익':_amount(q.get('영업이익'),financial_ccy), '순이익':_amount(q.get('당기순이익'),financial_ccy), '희석EPS':_val(q.get('희석EPS'))} for q in rows])
+                st.dataframe(frame,hide_index=True,use_container_width=True)
+            else:st.info('제공처에서 분기 실적 데이터를 제공하지 않거나 요청이 제한됐습니다. 특히 국내 종목·ETF는 미제공될 수 있습니다.')
+    with ta_target:
+        st.markdown('#### 애널리스트 목표가 집계')
+        if pd.notna(row['목표가']) and row['목표가']>0:
+            st.info(f"엑셀 입력 목표가: **{row['목표가']:,.2f} {row['통화']}** · 출처: {row['목표가출처'] or '미입력'} · 발표일: {row['목표가기준일'] or '미입력'}")
+        targets=research.get('analyst_targets',{})
+        if is_etf:
+            st.info('ETF는 개별 기업과 같은 증권사 목표주가 집계를 제공하지 않습니다. 기초자산·지수·괴리율·보수 등을 별도로 평가해야 합니다.')
+        elif _numeric(targets.get('mean')) is not None:
+            pcols=st.columns(3)
+            pcols[0].metric('목표가 평균',_val(targets.get('mean')))
+            pcols[1].metric('목표가 최저',_val(targets.get('low')))
+            pcols[2].metric('목표가 최고',_val(targets.get('high')))
+            currency=research.get('price_currency') or str(row['통화'])
+            st.caption(f'출처: Yahoo Finance 애널리스트 집계 · 가격통화 {currency} · 개별 증권사·발표일·집계 시각은 확인되지 않습니다.')
+            if price is not None and price>0 and currency==str(row['통화']).upper():
+                st.metric('평균 목표가와 공개 종가 차이',f"{(targets['mean']/price-1)*100:+.1f}%")
+            else:st.warning('통화 일치/공개 종가 확인이 어려워 목표가 괴리율을 산출하지 않았습니다.')
+        elif not pd.notna(row['목표가']):
+            st.info('목표가 정보가 조회되지 않았습니다. 임의 목표가를 생성하지 않습니다. 검증된 목표가가 있으면 엑셀에 출처·발표일과 함께 입력하세요.')
+        st.markdown('#### EPS 시장 추정치')
+        est=research.get('eps_estimates',[])
+        if est:
+            st.dataframe(pd.DataFrame([{'기간':p['기간'],'평균 EPS':_val(p.get('추정EPS')),'애널리스트 수':_val(p.get('분석기관수')),'추정 EPS 성장률':_val(p.get('EPS 성장률'),'%',True)} for p in est]),hide_index=True,use_container_width=True)
+            st.caption('Yahoo Finance 공개 분석가 집계. 제공처의 최신 갱신 시각과 추정 산식을 확인하지 못한 참고자료입니다.')
+        else:st.caption('EPS 컨센서스 미제공 또는 조회 실패')
+    with news_tab:
+        items=st.session_state['news_map'].get(symbol,[])
+        if not items:
+            st.info('위 **최신 뉴스 조회** 버튼을 누르면 이 종목의 최근 검색 기사와 출처 링크가 표시됩니다.')
+        for a in items[:8]:
+            st.markdown(f"**[{a['제목']}]({a['원문']})**")
+            st.caption(f"{a['언론사']} · {a['발행일']}")
+        if symbol in st.session_state['news_map'] and not items:st.warning(st.session_state.get('news_msg','검색 결과 없음 또는 RSS 제한'))
+        st.caption('Google News RSS의 종목명·티커 검색결과입니다. 제목과 기업명 일치 여부를 원문으로 검증하세요.')
+    with monitor:
+        st.markdown('#### 보유 포지션 분석')
+        for note in build_individual_note(row):st.markdown('• '+note)
+        st.markdown('#### 공개 시장데이터 기반 모니터링')
+        if research:
+            for note in _evidence_insights(row,research):st.markdown('• '+note)
+        else:st.info('공개 시장데이터를 조회하면 가격과 실적에 근거한 관리 포인트가 추가됩니다.')
+        st.warning('위 관찰사항은 정량 지표를 설명한 것이며 매수·매도 권유나 목표가 보증이 아닙니다. 투자 판단 및 외부 제공 전 내부 검토가 필요합니다.')
 
 with tab_news:
     st.subheader('보유종목 뉴스 모니터링')
@@ -541,7 +892,7 @@ with tab_report:
             if e.name=='reportlab':
                 st.error(r'PDF 생성에 필요한 reportlab 패키지가 설치되지 않았습니다. 앱 폴더에서 .\.venv\Scripts\python.exe -m pip install reportlab 을 실행하세요.')
             else:st.error(f'PDF 모듈 오류: {e}')
-        except Exception as e:st.error(f'PDF 생성 오류: {e}')
+        except Exception as e:st.error(f'PDF 생성 오류: {e}\n한글 글꼴이 필요하면 GitHub 저장소 최상위에 packages.txt(fonts-nanum)를 추가하세요.')
     if 'pdf_bytes' in st.session_state:
         st.download_button('⬇ PDF 다운로드',data=st.session_state['pdf_bytes'],file_name=f'hanav_private_{datetime.now():%Y%m%d}.pdf',mime='application/pdf',use_container_width=True)
         st.caption(f"생성된 범위: {st.session_state.get('pdf_scope','')} · 범위/자료 수정 시 PDF를 다시 생성하세요.")
@@ -551,4 +902,4 @@ with tab_report:
     st.markdown('• 데이터 제공사의 라이선스 및 대외 재배포 가능 여부  \n• 고객정보 처리 및 전산 보안 승인 여부  \n• 목표가·증권사 의견 인용의 적법성 및 근거 출처  \n• 고객 제공자료의 준법 검토 및 버전 이력 관리')
 
 st.divider()
-st.caption('HanaV Private Portfolio V1.0.3 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
+st.caption('HanaV Private Portfolio V1.0.5 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
