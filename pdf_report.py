@@ -140,6 +140,268 @@ def styles(font, bold):
     return s
 
 
+# -*- coding: utf-8 -*-
+"""Static print-first portfolio infographics with ReportLab only. No network calls."""
+from reportlab.platypus import Flowable
+
+SECTOR_HEX = (
+    '#B7DFD0', '#D1EAD1', '#AEDBE7', '#E5D9B3', '#CFC6E8', '#C9E4B4',
+    '#E7CCCA', '#C5D9E7', '#D8D8B1', '#B6D6CD', '#E1C9A7', '#BFD6EC',
+    '#E2D4DA', '#B9DFE0', '#D8E3D0', '#E2DABE', '#C3CBE1', '#E1D7C5',
+)
+
+
+def _chart_data(df, research_map, quote_map):
+    """Aggregate the *same ticker* over accounts; count positions separately.
+
+    A missing value cannot enter a proportion. Returns are aggregated from
+    complete position-level original-cost data, never averaged blindly.
+    """
+    cache = {}
+    for _, row in df.iterrows():
+        key = txt(row.get('티커'), txt(row.get('종목코드'), '미상'))
+        item = cache.setdefault(key, {
+            'ticker': key, 'name': txt(row.get('종목명'), txt(row.get('종목코드'), '미상')),
+            'sector': txt(row.get('업종'), '미분류'), 'value': 0.0,
+            'priced': 0, 'positions': 0, 'gain': 0.0, 'cost_complete': True,
+            'customers': set(),
+        })
+        item['positions'] += 1
+        item['customers'].add(txt(row.get('고객구분'), '미분류'))
+        value = number(row.get('평가액(원)'))
+        if value is not None and value > 0:
+            item['value'] += value
+            item['priced'] += 1
+        else:
+            item['cost_complete'] = False
+        gain = number(row.get('손익(원)'))
+        if gain is None:
+            item['cost_complete'] = False
+        else:
+            item['gain'] += gain
+    for item in cache.values():
+        if item['cost_complete'] and item['priced'] == item['positions']:
+            cost = item['value'] - item['gain']
+            item['roi'] = 100 * item['gain']/cost if cost > 0 else None
+        else:
+            item['roi'] = None
+    items = sorted(cache.values(), key=lambda x: (-x['value'], x['name']))
+    total = sum(x['value'] for x in items)
+    for x in items:
+        x['weight'] = 100*x['value']/total if total > 0 else None
+    sector_totals = {}
+    client_totals = {}
+    for _, row in df.iterrows():
+        val = number(row.get('평가액(원)'))
+        if val is None or val <= 0:
+            continue
+        sector = txt(row.get('업종'), '미분류')
+        customer = txt(row.get('고객구분'), '미분류')
+        sector_totals[sector] = sector_totals.get(sector, 0.0) + val
+        client_totals[customer] = client_totals.get(customer, 0.0) + val
+    sector_order = sorted(sector_totals, key=lambda x: (-sector_totals[x], x))
+    sector_colors = {k:SECTOR_HEX[i % len(SECTOR_HEX)] for i,k in enumerate(sector_order)}
+    return items, total, sector_totals, client_totals, sector_colors
+
+
+def _short_label(canvas, label, font, size, max_width):
+    s = str(label)
+    if canvas.stringWidth(s, font, size) <= max_width: return s
+    while len(s) > 1 and canvas.stringWidth(s+'…', font, size) > max_width:
+        s = s[:-1]
+    return s+'…' if s else '…'
+
+
+def _squarify_values(items, x, y, width, height):
+    """Squarified rectangle packing; x,y measured from bottom left."""
+    good = [a for a in items if a['value'] > 0]
+    if not good or width <= 0 or height <= 0: return []
+    total = sum(a['value'] for a in good)
+    scaled = [(a, a['value']/total*width*height) for a in good]
+    placed = []
+    def worst(area_list, side):
+        if not area_list or side <= 0:return float('inf')
+        areas = [a for _,a in area_list]
+        big=max(areas);small=min(areas);s=sum(areas)
+        return max(side*side*big/(s*s),s*s/(side*side*small)) if small>0 else float('inf')
+    def layout(row, bx, by, w, h):
+        a_sum=sum(a for _,a in row)
+        if w < h:
+            row_h=a_sum / w if w else 0
+            cursor=bx
+            for item,area in row:
+                cell_w=area/row_h if row_h else 0
+                placed.append((item, cursor, by+h-row_h, cell_w, row_h))
+                cursor += cell_w
+            return bx,by,w,max(0,h-row_h)
+        row_w=a_sum / h if h else 0
+        cursor=by+h
+        for item,area in row:
+            cell_h=area/row_w if row_w else 0
+            cursor -= cell_h
+            placed.append((item,bx,cursor,row_w,cell_h))
+        return bx+row_w,by,max(0,w-row_w),h
+    bx,by,w,h=x,y,width,height
+    row=[]
+    for item in scaled:
+        if not row:
+            row=[item];continue
+        side=min(w,h)
+        if worst(row+[item],side) <= worst(row,side):
+            row.append(item)
+        else:
+            bx,by,w,h=layout(row,bx,by,w,h)
+            row=[item]
+    if row:layout(row,bx,by,w,h)
+    return placed
+
+
+class PortfolioTreemap(Flowable):
+    def __init__(self, items, sector_colors, font, bold, width, height=490):
+        super().__init__()
+        self.items, self.sector_colors = items, sector_colors
+        self.font, self.bold, self.width, self.height = font,bold,width,height
+    def draw(self):
+        c = self.canv
+        c.setFillColor(colors.HexColor('#F5F9F7'))
+        c.roundRect(0,0,self.width,self.height,10,stroke=0,fill=1)
+        pad=10
+        if not any(item['value']>0 for item in self.items):
+            c.setFillColor(MUTED);c.setFont(self.font,11)
+            c.drawCentredString(self.width/2,self.height/2,'평가 가능한 종목이 없어 트리맵을 표시하지 않았습니다.')
+            return
+        geoms=_squarify_values(self.items,pad,pad,self.width-pad*2,self.height-pad*2)
+        for item,x,y,w,h in geoms:
+            gap=1.5
+            if w<4 or h<4:continue
+            c.setFillColor(colors.HexColor(self.sector_colors.get(item['sector'], '#DEE7E2')))
+            c.roundRect(x+gap,y+gap,max(0,w-2*gap),max(0,h-2*gap),3,fill=1,stroke=0)
+            c.setFillColor(DARK)
+            cw=w-11
+            if w>=45 and h>=25:
+                fontsize=8.3 if w>=68 else 7.2
+                c.setFont(self.bold,fontsize)
+                label=_short_label(c,item['name'],self.bold,fontsize,cw)
+                c.drawCentredString(x+w/2,y+h/2+3 if h>=38 else y+h/2-2,label)
+                if h>=38:
+                    c.setFont(self.font,7.6)
+                    pct_s=f"{item['weight']:.1f}%" if item['weight'] is not None else '—'
+                    c.drawCentredString(x+w/2,y+h/2-10,pct_s)
+        # Bounding box for print contrast
+        c.setStrokeColor(LINE);c.setLineWidth(0.6)
+        c.roundRect(0,0,self.width,self.height,10,stroke=1,fill=0)
+
+
+class PortfolioHeatmap(Flowable):
+    def __init__(self, items, font, bold, width, height=575, columns=8):
+        super().__init__()
+        self.items, self.font, self.bold = items,font,bold
+        self.width,self.height,self.columns = width,height,columns
+    @staticmethod
+    def tile_style(roi):
+        if roi is None:return '#EDF1EF', DARK
+        if roi>=20:return '#29977C', colors.white
+        if roi>=10:return '#66BEA3', DARK
+        if roi>=3:return '#A7DDCA', DARK
+        if roi>=0:return '#D9F2E9', DARK
+        if roi>=-3:return '#F9E2DB', DARK
+        if roi>=-10:return '#F2BAAA', DARK
+        if roi>=-20:return '#E78D7D', DARK
+        return '#C76559', colors.white
+    def draw(self):
+        c=self.canv
+        w=self.width
+        n=len(self.items)
+        nrows=max(1,math.ceil(n/self.columns))
+        # Height is per-page controlled (10 rows max).
+        pad=2.2
+        cell_w=(w-(self.columns-1)*pad)/self.columns
+        cell_h=(self.height-(nrows-1)*pad)/nrows
+        for i,item in enumerate(self.items):
+            col=i%self.columns;row=i//self.columns
+            x=col*(cell_w+pad)
+            y=self.height-(row+1)*cell_h-row*pad
+            bg,fg=self.tile_style(item['roi'])
+            c.setFillColor(colors.HexColor(bg));c.roundRect(x,y,cell_w,cell_h,3,stroke=0,fill=1)
+            c.setFillColor(fg)
+            lbl_size=7.2 if nrows>=9 else 7.8
+            c.setFont(self.bold,lbl_size)
+            c.drawCentredString(x+cell_w/2,y+cell_h-14,
+                _short_label(c,item['name'],self.bold,lbl_size,cell_w-8))
+            c.setFont(self.font,6.5)
+            c.drawCentredString(x+cell_w/2,y+cell_h-25,
+                _short_label(c,item['ticker'].replace('.KS','').replace('.KQ',''),self.font,6.5,cell_w-8))
+            c.setFont(self.bold,10.3)
+            value='미확인' if item['roi'] is None else f"{item['roi']:+.1f}%"
+            c.drawCentredString(x+cell_w/2,y+max(10,cell_h*0.26),value)
+
+
+class DistributionBars(Flowable):
+    def __init__(self, counts, total, colors_map, font, bold, width, height=360, max_items=10):
+        super().__init__()
+        self.counts,self.total,self.colors_map=counts,total,colors_map
+        self.font,self.bold,self.width,self.height=font,bold,width,height
+        self.max_items=max_items
+    def draw(self):
+        c=self.canv
+        ordered=sorted(((k,v) for k,v in self.counts.items() if v>0), key=lambda kv:-kv[1])
+        shown=ordered[:self.max_items]
+        if len(ordered)>self.max_items:
+            shown.append(('기타 업종',sum(v for _,v in ordered[self.max_items:])))
+        if not shown:
+            c.setFillColor(MUTED);c.setFont(self.font,10)
+            c.drawString(5,self.height-26,'평가 가능한 데이터가 없어 표시하지 않습니다.');return
+        # Max width absolute share of the portfolio, rather than normalizing to leader.
+        n=len(shown)
+        row_h=min(31,(self.height-12)/n)
+        label_w=98
+        value_w=88
+        bar_max=self.width-label_w-value_w-15
+        for i,(name,val) in enumerate(shown):
+            y=self.height-27-i*row_h
+            c.setFillColor(DARK);c.setFont(self.font,9)
+            c.drawString(2,y+3,_short_label(c,name,self.font,9,label_w-6))
+            c.setFillColor(colors.HexColor('#EAF0EC'))
+            c.roundRect(label_w,y-2,bar_max,14,3,fill=1,stroke=0)
+            share=100*val/self.total if self.total>0 else 0
+            if share>0:
+                c.setFillColor(colors.HexColor(self.colors_map.get(name,'#89C8B1')))
+                c.roundRect(label_w,y-2,bar_max*min(100,share)/100,14,3,fill=1,stroke=0)
+            c.setFillColor(DARK);c.setFont(self.bold,9)
+            c.drawRightString(self.width-3,y+2,f'{share:.1f}%  ·  {won(val)}')
+
+
+class HeatLegend(Flowable):
+    def __init__(self,font,width):
+        super().__init__();self.font,self.width,self.height=font,width,33
+    def draw(self):
+        c=self.canv
+        colors_info=[('#C76559','-20%↓'),('#E78D7D','-20~-10%'),('#F2BAAA','-10~0%'),('#EDF1EF','미확인'),('#A7DDCA','0~10%'),('#66BEA3','10~20%'),('#29977C','+20%↑')]
+        col_w=self.width/len(colors_info)
+        for i,(color,title) in enumerate(colors_info):
+            x=i*col_w
+            c.setFillColor(colors.HexColor(color));c.roundRect(x+1,17,14,11,2,fill=1,stroke=0)
+            c.setFillColor(MUTED);c.setFont(self.font,6.6)
+            c.drawString(x+17,19,title)
+
+
+class SectorLegend(Flowable):
+    def __init__(self, totals, cmap, font, width):
+        super().__init__()
+        self.totals,self.cmap,self.font,self.width=totals,cmap,font,width
+        self.height=44
+    def draw(self):
+        c=self.canv
+        top=sorted(self.totals,key=lambda k:-self.totals[k])[:10]
+        col_w=self.width/5
+        for i,k in enumerate(top):
+            x=(i%5)*col_w;y=27-(i//5)*20
+            c.setFillColor(colors.HexColor(self.cmap.get(k,'#D5E4DC')))
+            c.roundRect(x,y,11,11,2,stroke=0,fill=1)
+            c.setFillColor(MUTED);c.setFont(self.font,8.0)
+            c.drawString(x+16,y+1,_short_label(c,k,self.font,8.0,col_w-20))
+
+
 def build_pdf(df:pd.DataFrame, mode:str, fx_source:str, demo:bool=False,
               research_map:dict|None=None, news_map:dict|None=None, quote_map:dict|None=None)->bytes:
     research_map=research_map or {}
@@ -236,17 +498,69 @@ def build_pdf(df:pd.DataFrame, mode:str, fx_source:str, demo:bool=False,
     title('보고서 해석 시 유의사항')
     flow.append(p('보유 수익률은 입력한 매입단가·기준가에 따른 계산값이며 실현손익, 배당금, 거래비용을 반영하지 않습니다. 뉴스는 사실 검증 및 종목 관련성 확인이 필요하며, 공개 집계 목표가는 개별 기관의 발표일을 확인하지 않은 값입니다.','body'))
 
+    # V1.0.9: infographic-first report. No long holdings table.
+    holdings, valued_total, industry_totals, customer_totals, sector_palette = _chart_data(
+        df, research_map, quote_map
+    )
+    assessed_count = sum(x['priced']==x['positions'] for x in holdings)
+    missing_count = sum(x['priced']<x['positions'] for x in holdings)
+    chart_limit_note = ('분석 비중은 원화 평가금액이 확인된 종목만 기준입니다. 전체 자산의 구성비가 아닐 수 있습니다.'
+                        if not m['complete_total'] else
+                        '입력한 평가가격 기준이며 ETF 내부 구성종목 중복은 전개되지 않습니다.')
+
     flow.append(PageBreak())
-    title('전 종목 보유 현황')
-    flow.append(p('평가금액이 큰 순서입니다. 종목 비중과 평가손익은 입력가격 또는 선택된 시세 기준입니다.','micro'))
+    flow.append(p('01  /  ASSET MAP','brand'))
+    flow.append(Spacer(1,2*mm))
+    flow.append(p('보유비중 트리맵','main'))
+    flow.append(p(f'전체 {len(df)}개 포지션 · 고유 종목 {len(holdings)}개 · 평가금액 기준 · 색상은 입력 업종', 'micro'))
+    flow.append(Spacer(1,4*mm))
+    flow.append(PortfolioTreemap(holdings,sector_palette,font,bold,W,height=485))
+    flow.append(Spacer(1,4*mm))
+    flow.append(p('주요 업종 범례','smallgreen'))
+    flow.append(Spacer(1,2*mm))
+    flow.append(SectorLegend(industry_totals,sector_palette,font,W))
+    flow.append(Spacer(1,2*mm))
+    flow.append(p(f'사각형 면적 = 원화 평가액 비중 · 동일 종목은 고객별 보유를 합산 · 평가 누락 종목 {missing_count}개', 'micro'))
+    flow.append(p(chart_limit_note,'micro'))
+
+    # Matrix uses constant-size tiles: small positions are as legible as large ones.
+    # Split after 80 unique tickers to prevent tiny, unreadable labels.
+    chunk_size = 80
+    chunks = [holdings[i:i+chunk_size] for i in range(0,len(holdings),chunk_size)] or [[]]
+    for page_idx,chunk in enumerate(chunks):
+        flow.append(PageBreak())
+        flow.append(p('02  /  PERFORMANCE MATRIX','brand'))
+        flow.append(Spacer(1,2*mm))
+        flow.append(p('전 종목 수익률 히트맵','main'))
+        flow.append(p(f'전 종목 {len(holdings)}개 · {page_idx+1}/{len(chunks)}페이지 · 각 칸 크기는 동일 · 평가금액 내림차순', 'micro'))
+        flow.append(Spacer(1,4*mm))
+        flow.append(HeatLegend(font,W))
+        flow.append(Spacer(1,1*mm))
+        # 8 columns, max. 10 rows on one A4 page.
+        flow.append(PortfolioHeatmap(chunk,font,bold,W,height=580,columns=8))
+        flow.append(Spacer(1,3*mm))
+        flow.append(p('색상 및 수치는 입력 매입단가 대비 평가수익률입니다. 배당·수수료·실현손익은 포함하지 않습니다.','micro'))
+        flow.append(p('매입단가·평가액이 미확인된 종목은 회색으로 표시합니다. 고유 종목 기준이며 고객 간 합산 수익률을 사용합니다.','micro'))
+
+    flow.append(PageBreak())
+    flow.append(p('03  /  ASSET ALLOCATION','brand'))
+    flow.append(Spacer(1,2*mm))
+    flow.append(p('업종 · 고객별 자산 구성','main'))
+    flow.append(p('전체 평가 가능 금액 기준. 각 막대 길이는 전체 평가자산 중 해당 항목 비율을 의미합니다.','micro'))
+    flow.append(Spacer(1,5*mm))
+    title('업종별 투자 비중')
+    flow.append(DistributionBars(industry_totals,valued_total,sector_palette,font,bold,W,height=353,max_items=10))
+    flow.append(Spacer(1,6*mm))
+    title('고객별 투자 비중')
+    # Larger family trees paginate automatically rather than silently omitting customers.
+    top_clients=dict(sorted(customer_totals.items(),key=lambda x:-x[1])[:10])
+    remaining=sum(v for k,v in customer_totals.items() if k not in top_clients)
+    if remaining>0:top_clients['기타 고객']=remaining
+    client_palette={k:SECTOR_HEX[i % len(SECTOR_HEX)] for i,k in enumerate(top_clients)}
+    flow.append(DistributionBars(top_clients,valued_total,client_palette,font,bold,W,height=165,max_items=11))
     flow.append(Spacer(1,3*mm))
-    rows=[]
-    for _,r in sorted_df.iterrows():
-        sym=txt(r.get('종목명'),txt(r.get('종목코드'),'—'))
-        rows.append([txt(r.get('고객구분'))[:10],sym[:20],fmt(r.get('보유수량')),won(r.get('평가액(원)')),
-                     fmt(r.get('평가액비중(%)'),1,'%'),txt(r.get('모니터링'),'정기 점검')[:18]])
-    col_widths=[20*mm,42*mm,20*mm,35*mm,17*mm,42*mm]
-    flow.append(sectiontable(['고객','종목','수량','평가액','비중','상태'],rows,col_widths,aligns=[2,3,4]))
+    flow.append(p(chart_limit_note,'micro'))
+    flow.append(p('업종은 사용자가 입력한 분류이며 ETF의 기초 종목을 업종별로 재분류하지 않았습니다.','micro'))
     flow.append(PageBreak())
 
     def current_quote(res,quote):
