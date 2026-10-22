@@ -16,7 +16,7 @@ from services import fetch_history_batch,fetch_fx_krw_per_usd,fetch_google_news,
 
 st.set_page_config(page_title='HanaV Private Portfolio',page_icon='💠',layout='wide',initial_sidebar_state='expanded')
 st.markdown('''<style>
-/* HanaV Private Portfolio V1.0.9 — refined premium jade theme.
+/* HanaV Private Portfolio V1.0.10 — refined premium jade theme.
    This visual layer intentionally works even if GitHub retains the old dark
    .streamlit/config.toml. No changes to financial calculations or uploads. */
 :root {
@@ -104,6 +104,25 @@ section[data-testid="stSidebar"], [data-testid="stSidebar"],
 [data-testid="stMetricLabel"], [data-testid="stMetricLabel"] * {color:#D6F1E1 !important;}
 [data-testid="stMetricValue"], [data-testid="stMetricValue"] * {color:#FFFFFF !important;}
 [data-testid="stMetricDelta"], [data-testid="stMetricDelta"] * {font-weight:600;}
+/* Avoid Streamlit's default ellipsis and use a compact value that fits cards. */
+[data-testid="stMetricValue"], [data-testid="stMetricValue"] > div {
+  font-size:clamp(1.35rem, 1.85vw, 2.05rem) !important;
+  letter-spacing:-.035em !important;
+  font-variant-numeric:tabular-nums;
+  white-space:nowrap !important;
+  text-overflow:clip !important;
+}
+[data-testid="stMetricValue"] {overflow:visible !important;}
+/* Streamlit Markdown news links must stay readable on green panels. */
+[data-testid="stMain"] [data-testid="stMarkdownContainer"] a,
+[data-testid="stMain"] .stMarkdownContainer a {
+  color:#B7FFE2 !important;
+  text-decoration:underline !important;
+  text-underline-offset:3px;
+  font-weight:650;
+}
+[data-testid="stMain"] [data-testid="stMarkdownContainer"] a:visited {color:#D7D1FF !important;}
+[data-testid="stMain"] [data-testid="stMarkdownContainer"] a:hover {color:#FFFFFF !important;}
 /* Tabs: make both active and inactive menu labels legible. */
 .stTabs [data-baseweb="tab-list"] {gap:12px;border-bottom:1px solid #507D6B !important;}
 .stTabs [data-baseweb="tab"],.stTabs button[role="tab"] {
@@ -248,16 +267,56 @@ def _val(v,suffix='',percent_raw=False):
     x=_numeric(v)
     return '미제공' if x is None else f'{(x*100 if percent_raw else x):,.2f}{suffix}'
 
+
+def _compact_price(v, currency):
+    """Keep the KPI tile short. Exact numeric amount is displayed separately."""
+    x=_numeric(v)
+    if x is None: return '미조회'
+    c=str(currency).upper()
+    if c=='KRW':
+        if abs(x)>=100_000_000:return f'{x/100_000_000:,.2f}억'
+        if abs(x)>=10_000:return f'{x/10_000:,.1f}만'
+        return f'{x:,.0f}'
+    if abs(x)>=100_000:return f'{x/1000:,.1f}k'
+    return f'{x:,.2f}'
+
+
+def _has_financial_data(result):
+    """Check business fundamentals (not quote-only market capitalization)."""
+    if not isinstance(result,dict):return False
+    info=result.get('info') or {}
+    keys=('trailingPE','forwardPE','priceToBook','trailingEps','forwardEps',
+          'returnOnEquity','operatingMargins','profitMargins','revenueGrowth','earningsGrowth')
+    if any(_numeric(info.get(k)) is not None for k in keys):return True
+    if any(any(_numeric(q.get(field)) is not None for field in ('매출액','영업이익','당기순이익','희석EPS'))
+           for q in (result.get('quarters') or [])): return True
+    return any(_numeric(e.get('추정EPS')) is not None or _numeric(e.get('EPS 성장률')) is not None
+               for e in (result.get('eps_estimates') or []))
+
+
+def _research_status(result, was_attempted=False):
+    if not was_attempted and not result:return '미시도'
+    if _has_financial_data(result):return '재무 확보'
+    if not isinstance(result,dict):return '조회 오류'
+    if result.get('errors') or result.get('error'):return '자료 미제공/오류'
+    return '재무 미제공'
+
 def _income_rows(df):
     if not isinstance(df,pd.DataFrame) or df.empty:return []
-    labels={'Total Revenue':'매출액','Operating Income':'영업이익','Net Income':'당기순이익','Diluted EPS':'희석EPS'}
+    # yfinance returns CamelCase with pretty=False, and spaced labels with pretty=True.
+    aliases={
+        '매출액':('TotalRevenue','Total Revenue','OperatingRevenue','Operating Revenue'),
+        '영업이익':('OperatingIncome','Operating Income'),
+        '당기순이익':('NetIncome','Net Income','NetIncomeCommonStockholders'),
+        '희석EPS':('DilutedEPS','Diluted EPS','DilutedEps'),
+    }
     rows=[]
-    # Financial statement columns typically contain quarter-end timestamps.
     for dt in sorted(df.columns,reverse=True)[:4]:
         row={'기간':str(dt)[:10]}
-        for key,korean in labels.items():
-            row[korean]=_numeric(df.loc[key,dt]) if key in df.index else None
-        rows.append(row)
+        for label,choices in aliases.items():
+            row[label]=next((_numeric(df.loc[key,dt]) for key in choices if key in df.index
+                             and _numeric(df.loc[key,dt]) is not None),None)
+        if any(row[label] is not None for label in aliases):rows.append(row)
     return rows
 
 def _estimate_rows(df):
@@ -271,7 +330,7 @@ def _estimate_rows(df):
     return rows
 
 @st.cache_data(ttl=3600,show_spinner=False,max_entries=100)
-def fetch_selected_research(ticker:str,is_etf:bool=False)->dict:
+def fetch_selected_research(ticker:str,is_etf:bool=False,include_price:bool=True,cache_buster:str='')->dict:
     """Fetch only the PUBLIC ticker (no holdings, customer ids, account or costs)."""
     import yfinance as yf
     from services import _extract_price_history
@@ -279,21 +338,25 @@ def fetch_selected_research(ticker:str,is_etf:bool=False)->dict:
     if not re.fullmatch(r'[A-Z0-9^.=\-]{1,25}',ticker.upper()):
         return {'error':'종목코드 형식이 올바르지 않습니다.','asof':datetime.now().strftime('%Y-%m-%d %H:%M'),'errors':['잘못된 티커']}
     out={'ticker':ticker,'asof':datetime.now().strftime('%Y-%m-%d %H:%M'),'errors':[],
-         'quote':{},'info':{},'analyst_targets':{},'quarters':[],'eps_estimates':[], 'price_currency':'','financial_currency':''}
+         'quote':{},'info':{},'analyst_targets':{},'quarters':[],'eps_estimates':[], 'price_currency':'','financial_currency':'', 'source_status':{}}
     t=yf.Ticker(ticker)
-    try:
-        history=t.history(period='1y',interval='1d',auto_adjust=False,timeout=16)
-        from services import _extract_price_history
-        out['quote']=_extract_price_history(history)
-        if out['quote']:
-            close=out['quote'].get('history')
-            if isinstance(close,pd.Series) and len(close)>=16:
-                diff=close.diff();up=diff.clip(lower=0).ewm(alpha=1/14,adjust=False).mean()
-                down=(-diff.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
-                d=_numeric(down.iloc[-1]);u=_numeric(up.iloc[-1])
-                if d is not None and u is not None:
-                    out['quote']['rsi14']=100.0 if d==0 and u>0 else (100-(100/(1+(u/d)))) if d>0 else None
-    except Exception as e:out['errors'].append('가격 이력: '+str(e)[:100])
+    if include_price:
+        try:
+            history=t.history(period='1y',interval='1d',auto_adjust=False,timeout=16)
+            from services import _extract_price_history
+            out['quote']=_extract_price_history(history)
+            if out['quote']:
+                close=out['quote'].get('history')
+                if isinstance(close,pd.Series) and len(close)>=16:
+                    diff=close.diff();up=diff.clip(lower=0).ewm(alpha=1/14,adjust=False).mean()
+                    down=(-diff.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
+                    d=_numeric(down.iloc[-1]);u=_numeric(up.iloc[-1])
+                    if d is not None and u is not None:
+                        out['quote']['rsi14']=100.0 if d==0 and u>0 else (100-(100/(1+(u/d)))) if d>0 else None
+        except Exception as e:out['errors'].append('가격 이력: '+str(e)[:100])
+        out['source_status']['가격']= '확보' if out['quote'] else '미제공/오류'
+    else:
+        out['source_status']['가격']='별도 일괄수집'
     try:
         info=t.get_info() or {}
         keys=['shortName','longName','currency','financialCurrency','sector','industry','longBusinessSummary',
@@ -304,16 +367,24 @@ def fetch_selected_research(ticker:str,is_etf:bool=False)->dict:
         out['price_currency']=str(info.get('currency') or '').upper()
         out['financial_currency']=str(info.get('financialCurrency') or info.get('currency') or '').upper()
     except Exception as e:out['errors'].append('기본 지표: '+str(e)[:100])
+    out['source_status']['기본지표']='확보' if out['info'] else '미제공/오류'
     if not is_etf:
         try:
             targets=t.get_analyst_price_targets() or {}
             if isinstance(targets,dict):
                 out['analyst_targets']={k:_numeric(targets.get(k)) for k in ('current','low','mean','median','high')}
         except Exception as e:out['errors'].append('목표가 집계: '+str(e)[:100])
+        out['source_status']['목표가']='확보' if _numeric(out['analyst_targets'].get('mean')) is not None else '미제공/오류'
         try:out['quarters']=_income_rows(t.get_income_stmt(freq='quarterly'))
         except Exception as e:out['errors'].append('분기 실적: '+str(e)[:100])
+        out['source_status']['분기실적']='확보' if out['quarters'] else '미제공/오류'
         try:out['eps_estimates']=_estimate_rows(t.get_earnings_estimate())
         except Exception as e:out['errors'].append('EPS 추정: '+str(e)[:100])
+        out['source_status']['EPS추정']='확보' if out['eps_estimates'] else '미제공/오류'
+    else:
+        out['source_status'].update({'목표가':'ETF 제외','분기실적':'ETF 제외','EPS추정':'ETF 제외'})
+    if not _has_financial_data(out):
+        out['errors'].append('재무·실적: 공개 공급처 응답에 활용 가능한 수치가 없습니다 (ETF·시장별 제한 또는 접근차단 가능).')
     return out
 
 def _evidence_insights(row:pd.Series,market:dict)->list[str]:
@@ -550,7 +621,7 @@ st.session_state.setdefault('fx_source','가상 환율' if st.session_state['is_
 
 with st.sidebar:
     st.markdown('## 💠 HanaV Private')
-    st.caption('Portfolio Intelligence | V1.0.9')
+    st.caption('Portfolio Intelligence | V1.0.10')
     if st.button('로그아웃',use_container_width=True):
         # Completely clear current browser session's customer-position data.
         st.session_state.clear()
@@ -676,8 +747,10 @@ tab_dashboard,tab_holdings,tab_research,tab_news,tab_report=st.tabs(['📊 대�
 with tab_dashboard:
     c1,c2,c3,c4=st.columns(4)
     c1.metric('보유 포지션',f"{summary['positions']:,}개")
-    value_string=(f"{summary['value_krw']/1e8:,.2f}억원" if pd.notna(summary['value_krw']) else '평가 불가')
+    value_string=(f"{summary['value_krw']/1e8:,.1f}억" if pd.notna(summary['value_krw']) else '평가 불가')
     c2.metric('평가 가능한 자산 합계',value_string,help='일부 가격·환율 누락 시 전체 총액이 아닙니다.')
+    if pd.notna(summary['value_krw']):
+        st.caption(f"조회 기준 평가액: **{summary['value_krw']:,.0f}원 ({summary['value_krw']/1e8:,.2f}억 원)** · 가격/환율 미반영 {summary['unconverted']}개")
     c3.metric('가격/환율 미반영',f"{summary['unconverted']}개")
     c4.metric('최대 보유비중',f"{summary['largest_weight']:.1f}%" if pd.notna(summary['largest_weight']) else '—')
     if not summary['complete_total']:st.error('**불완전한 평가금액**: 미조회 포지션이 있으므로 위 합계와 비중은 일부 자산 기준입니다.')
@@ -688,8 +761,10 @@ with tab_dashboard:
         if not chart_df.empty:
             chart_df['표기']=chart_df.apply(lambda r:(r['종목명'] or r['종목코드'])[:20],axis=1)
             fig=px.bar(chart_df.sort_values('평가액(원)'),x='평가액(원)',y='표기',orientation='h',color_discrete_sequence=['#13B985'],height=425)
-            fig.update_layout(paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)',font_color='#F1FFF7',margin=dict(l=0,r=8,t=5,b=5),yaxis_title='',xaxis_title='KRW')
-            st.plotly_chart(fig,use_container_width=True)
+            fig.update_layout(paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)',font=dict(color='#F1FFF7',size=12),margin=dict(l=0,r=8,t=5,b=5),yaxis_title='',xaxis_title='KRW')
+            fig.update_xaxes(tickfont=dict(color='#DDF6E8'),title_font=dict(color='#DDF6E8'))
+            fig.update_yaxes(tickfont=dict(color='#EDF9F2'))
+            st.plotly_chart(fig,use_container_width=True,theme=None)
         else:st.info('평가액을 표시할 수 있는 기준가가 없습니다.')
     with g2:
         st.subheader('자산 분포')
@@ -698,8 +773,11 @@ with tab_dashboard:
         if not sector_df.empty:
             sums=sector_df.groupby('업종')['평가액(원)'].sum().reset_index()
             fig=px.pie(sums,names='업종',values='평가액(원)',hole=.58,color_discrete_sequence=['#0EB780','#54D7B8','#337B6E','#C2A777','#7EC4D5','#397F67','#ADDDC7'])
-            fig.update_layout(paper_bgcolor='rgba(0,0,0,0)',font_color='#F1FFF7',height=425,margin=dict(t=8,l=8,b=8,r=8))
-            st.plotly_chart(fig,use_container_width=True)
+            fig.update_traces(textinfo='none',hovertemplate='%{label}: %{percent:.1%}<extra></extra>')
+            fig.update_layout(paper_bgcolor='rgba(0,0,0,0)',font=dict(color='#F4FFF9',size=12),
+                              legend=dict(font=dict(color='#F4FFF9',size=12),bgcolor='rgba(0,0,0,0)'),
+                              height=425,margin=dict(t=8,l=8,b=8,r=8))
+            st.plotly_chart(fig,use_container_width=True,theme=None)
         else:st.info('업종분포 계산에 필요한 평가액이 없습니다.')
     st.subheader('VVIP 모니터링 포인트')
     for msg in risk_findings(positions):st.markdown('• '+msg)
@@ -745,6 +823,7 @@ with tab_research:
             with st.spinner(f'{symbol} 공개 시장데이터 조회 중 — 종목코드 외 고객정보는 전송하지 않습니다'):
                 result=fetch_selected_research(symbol,is_etf)
             st.session_state['deep_research'][symbol]=result
+            st.session_state.pop('pdf_bytes',None)
             articles,msg=cached_news(symbol,str(row['종목명']))
             st.session_state['news_map'][symbol]=articles
             st.session_state['news_msg']=msg
@@ -757,6 +836,7 @@ with tab_research:
             items,msg=cached_news(symbol,str(row['종목명']))
             st.session_state['news_map'][symbol]=items
             st.session_state['news_msg']=msg
+            st.session_state.pop('pdf_bytes',None)
             st.rerun()
     research=st.session_state.get('deep_research',{}).get(symbol,{})
     quote=research.get('quote') or st.session_state.get('quotes',{}).get(symbol,{})
@@ -770,12 +850,13 @@ with tab_research:
     else:
         st.info('아직 시장데이터를 조회하지 않았습니다. 위의 **시세 · 실적 · 목표가 조회** 버튼을 눌러주세요. 파일 입력 기준가와 실시간 시세는 구분됩니다.')
     metrics=st.columns(5)
-    metrics[0].metric('최근 공개 종가',f'{price:,.2f} {row["통화"]}' if price is not None else '미조회')
+    metrics[0].metric(f'최근 공개 종가 ({row["통화"]})',_compact_price(price,row['통화']),help='정확한 소수점 종가는 아래 기준일/출처에 함께 표시됩니다.')
     metrics[1].metric('1개월 등락률',_val(quote.get('ret_1m'),'%' ) if quote else '미조회')
     metrics[2].metric('3개월 등락률',_val(quote.get('ret_3m'),'%' ) if quote else '미조회')
     metrics[3].metric('보유 수익률',f"{row['수익률(%)']:+.2f}%" if pd.notna(row['수익률(%)']) else '매입가 필요')
     metrics[4].metric('평가액 비중',f"{row['평가액비중(%)']:.2f}%" if pd.notna(row['평가액비중(%)']) else '평가 불가')
-    st.caption(f"공개 종가 기준일: {quote.get('date','미조회') if quote else '미조회'} · 출처: {quote.get('source','없음') if quote else '없음'} · 수익률/비중은 현재 선택된 평가 기준으로 계산됩니다.")
+    st.caption(f"정확한 최근 종가: **{price:,.2f} {row['통화']}** · 기준일 {quote.get('date','미조회')}" if price is not None else '공개 종가 미조회')
+    st.caption(f"출처: {quote.get('source','없음') if quote else '없음'} · 수익률/비중은 현재 선택된 평가 기준으로 계산됩니다.")
     ta,fun,ta_target,news_tab,monitor=st.tabs(['📈 주가 · 기술지표','📊 재무 · 실적','🎯 목표가 · 추정','📰 최근 뉴스','🧭 관리 전략'])
     with ta:
         d1,d2=st.columns([1.7,1])
@@ -788,7 +869,7 @@ with tab_research:
                 for days,name,color in [(20,'MA20','#EEC978'),(60,'MA60','#92BAFA'),(120,'MA120','#D1A9EA')]:
                     if len(hist)>=days:fig.add_trace(go.Scatter(x=hist.index,y=hist.rolling(days).mean(),name=name,line=dict(color=color,width=1.3)))
                 fig.update_layout(height=440,paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)',font_color='#F1FFF7',margin=dict(l=0,r=0,t=0,b=0),legend=dict(orientation='h',y=1.08))
-                st.plotly_chart(fig,use_container_width=True)
+                st.plotly_chart(fig,use_container_width=True,theme=None)
             else:st.info('가격 차트는 해당 종목의 시장데이터 조회가 성공하면 표시됩니다.')
         with d2:
             st.markdown('#### 기술지표 요약')
@@ -803,6 +884,11 @@ with tab_research:
         st.markdown('#### 기업 재무 핵심지표')
         if not research:st.info('상단의 종합분석 실행 버튼을 눌러주세요.')
         else:
+            if not _has_financial_data(research):
+                st.warning('기업 실적/재무 수치를 확보하지 못했습니다. 시세 조회 성공과 재무 데이터 제공은 별개입니다.')
+            with st.expander('재무 데이터 조회 진단 · 어떤 단계가 실패했나요?',expanded=not _has_financial_data(research)):
+                st.json(research.get('source_status',{}))
+                for reason in research.get('errors',[]): st.caption('• '+str(reason))
             info_cols=st.columns(4)
             items=[('시가총액',_amount(info.get('marketCap'),research.get('price_currency',''))),
                    ('PER (TTM)',_val(info.get('trailingPE'))),('예상 PER',_val(info.get('forwardPE'))),('PBR',_val(info.get('priceToBook'))),
@@ -893,22 +979,32 @@ with tab_report:
     research_for_report=st.session_state.get('deep_research',{})
     news_for_report=st.session_state.get('news_map',{})
     def has_analysis_data(result):
-        if not isinstance(result,dict): return False
-        info=result.get('info') or {}
-        keys=('trailingPE','forwardPE','returnOnEquity','revenueGrowth','totalRevenue','marketCap')
-        if isinstance(info,dict) and any(_numeric(info.get(k)) is not None for k in keys):return True
-        if result.get('quarters'): return True
-        targets=result.get('analyst_targets') or {}
-        return isinstance(targets,dict) and _numeric(targets.get('mean')) is not None
+        return _has_financial_data(result)
     covered_prices=sum(_numeric((quotes_for_report.get(t) or {}).get('price')) is not None or
                        _numeric((research_for_report.get(t) or {}).get('quote',{}).get('price')) is not None
                        for t in symbols_for_report)
     covered_deep=sum(has_analysis_data(research_for_report.get(t)) for t in symbols_for_report)
     covered_news=sum(bool(news_for_report.get(t)) for t in symbols_for_report)
+    attempted_tickers=set(st.session_state.get('attempted_research',[])) | set(research_for_report)
+    attempted_count=len(attempted_tickers.intersection(symbols_for_report))
+    failed_fundamentals=[t for t in symbols_for_report if t in attempted_tickers and not has_analysis_data(research_for_report.get(t))]
+    not_attempted=len(symbols_for_report)-attempted_count
     metrics=st.columns(3)
     metrics[0].metric('시장 추세 수집',f'{covered_prices}/{len(symbols_for_report)}')
-    metrics[1].metric('재무·실적 확보',f'{covered_deep}/{len(symbols_for_report)}')
+    metrics[1].metric('재무·실적 확보',f'{covered_deep}/{len(symbols_for_report)}',help='시세 조회와 별개. ② 기업분석 실행으로 재무지표, 분기실적 또는 EPS 추정치를 확보한 종목 수')
     metrics[2].metric('최근 뉴스',f'{covered_news}/{len(symbols_for_report)}')
+    if attempted_count==0:
+        st.info('재무 조회 **미실행**: ① 시세만 수집한 상태입니다. ② 다음 미조회 기업 분석을 눌러 5~10개씩 진행하세요.')
+    else:
+        st.caption(f'재무·실적 조회 진행: **시도 {attempted_count}/{len(symbols_for_report)}건 · 확보 {covered_deep}건 · 미제공/오류 {len(failed_fundamentals)}건 · 미시도 {not_attempted}건**')
+        if failed_fundamentals:
+            with st.expander(f'재무 미확보 {len(failed_fundamentals)}종목 조회 진단'):
+                for ticker in failed_fundamentals[:65]:
+                    result=research_for_report.get(ticker,{}) or {}
+                    error_msgs=result.get('errors',[]) or ([str(result.get('error'))] if result.get('error') else [])
+                    status=result.get('source_status',{})
+                    st.write(f'**{ticker}** · {", ".join(error_msgs[:2]) or "지표 미제공"}')
+                    if status:st.caption(' · '.join(f'{k}: {v}' for k,v in status.items()))
     st.markdown('#### 보고서용 자료 수집')
     st.caption('외부에는 공개 티커·종목명만 조회하며 고객별칭·수량·매입단가는 전송하지 않습니다. 시세 조회는 엑셀 기준가 평가액을 자동으로 변경하지 않습니다.')
     cprice,cdeep,cnews=st.columns(3)
@@ -929,6 +1025,7 @@ with tab_report:
             help='최상위 종목부터 이미 조회한 종목을 건너뛰고 다음 미조회 종목으로 이어집니다.')
         retry_empty=st.checkbox('자료 없는 종목 재시도',value=False,
             help='체크하면 과거 요청했지만 재무지표가 확보되지 않은 종목부터 재조회합니다.')
+        st.caption('가격 조회와 별도 작업입니다. 무료 공개 데이터 특성상 실적 미제공 또는 호출제한이 발생할 수 있습니다.')
         if st.button('② 다음 미조회 기업 분석',use_container_width=True):
             attempted=set(st.session_state.get('attempted_research',[])) | set(st.session_state.get('deep_research',{}))
             if retry_empty:
@@ -941,10 +1038,11 @@ with tab_report:
             else:
                 bar=st.progress(0,text='기업분석 수집 시작')
                 successes=0
+                retry_token=datetime.now().isoformat(timespec='microseconds') if retry_empty else ''
                 for idx,t in enumerate(targets,1):
                     is_etf=bool(positions.loc[positions['티커']==t,'종목유형'].astype(str).str.upper().str.contains('ETF').any())
                     try:
-                        result=fetch_selected_research(t,is_etf)
+                        result=fetch_selected_research(t,is_etf,include_price=not bool(quotes_for_report.get(t)),cache_buster=retry_token)
                         st.session_state['deep_research'][t]=result
                         if has_analysis_data(result):successes+=1
                     except Exception as e:
@@ -999,4 +1097,4 @@ with tab_report:
     st.markdown('• 데이터 제공사의 라이선스 및 대외 재배포 가능 여부  \n• 고객정보 처리 및 전산 보안 승인 여부  \n• 목표가·증권사 의견 인용의 적법성 및 근거 출처  \n• 고객 제공자료의 준법 검토 및 버전 이력 관리')
 
 st.divider()
-st.caption('HanaV Private Portfolio V1.0.9 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
+st.caption('HanaV Private Portfolio V1.0.10 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
