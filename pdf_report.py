@@ -108,13 +108,16 @@ def valid_url(url):
 
 
 def has_fundamentals(r):
-    if not isinstance(r, dict): return False
-    i = r.get('info') or {}
-    keys = ('trailingPE','forwardPE','returnOnEquity','revenueGrowth','profitMargins','totalRevenue','marketCap')
-    info_found = isinstance(i, dict) and any(number(i.get(k)) is not None for k in keys)
-    quarters = bool(r.get('quarters'))
-    target = isinstance(r.get('analyst_targets'), dict) and number(r['analyst_targets'].get('mean')) is not None
-    return info_found or quarters or target
+    """Same financial coverage rule as app.py; not quote or market cap alone."""
+    if not isinstance(r,dict):return False
+    i=r.get('info') or {}
+    keys=('trailingPE','forwardPE','priceToBook','trailingEps','forwardEps',
+          'returnOnEquity','operatingMargins','profitMargins','revenueGrowth','earningsGrowth')
+    if any(number(i.get(k)) is not None for k in keys):return True
+    if any(any(number(q.get(k)) is not None for k in ('매출액','영업이익','당기순이익','희석EPS'))
+           for q in (r.get('quarters') or [])):return True
+    return any(number(e.get('추정EPS')) is not None or number(e.get('EPS 성장률')) is not None
+               for e in (r.get('eps_estimates') or []))
 
 
 def styles(font, bold):
