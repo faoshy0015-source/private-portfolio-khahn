@@ -16,7 +16,7 @@ from services import fetch_history_batch,fetch_fx_krw_per_usd,fetch_google_news,
 
 st.set_page_config(page_title='HanaV Private Portfolio',page_icon='💠',layout='wide',initial_sidebar_state='expanded')
 st.markdown('''<style>
-/* HanaV Private Portfolio V1.0.6 — refined premium jade theme.
+/* HanaV Private Portfolio V1.0.7 — refined premium jade theme.
    This visual layer intentionally works even if GitHub retains the old dark
    .streamlit/config.toml. No changes to financial calculations or uploads. */
 :root {
@@ -543,13 +543,14 @@ st.session_state.setdefault('editor_rev',0)
 st.session_state.setdefault('quotes',{})
 st.session_state.setdefault('news_map',{})
 st.session_state.setdefault('deep_research',{})
+st.session_state.setdefault('attempted_research',[])
 st.session_state.setdefault('report_quotes',{})
 st.session_state.setdefault('fx_val',1350.0)  # 가상 65종목 시연 전용; 실제 업로드 시 0으로 초기화
 st.session_state.setdefault('fx_source','가상 환율' if st.session_state['is_demo'] else '입력 없음')
 
 with st.sidebar:
     st.markdown('## 💠 HanaV Private')
-    st.caption('Portfolio Intelligence | V1.0.6')
+    st.caption('Portfolio Intelligence | V1.0.7')
     if st.button('로그아웃',use_container_width=True):
         # Completely clear current browser session's customer-position data.
         st.session_state.clear()
@@ -576,6 +577,7 @@ with st.sidebar:
                 st.session_state['quote_errors']=[]
                 st.session_state['news_map']={}
                 st.session_state['deep_research']={}
+                st.session_state['attempted_research']=[]
                 st.session_state['report_quotes']={}
                 st.session_state.pop('selected_research_index',None)
                 st.session_state['fx_val']=0.0
@@ -594,6 +596,7 @@ with st.sidebar:
         st.session_state['quotes']={}
         st.session_state['news_map']={}
         st.session_state['deep_research']={}
+        st.session_state['attempted_research']=[]
         st.session_state['report_quotes']={}
         st.session_state.pop('selected_research_index',None)
         st.session_state['fx_val']=1350.0
@@ -883,18 +886,28 @@ with tab_news:
 
 with tab_report:
     st.subheader('전담 포트폴리오 정기 점검 보고서')
-    st.write('**전체 보유종목별 개별 분석 카드**가 PDF에 수록됩니다. 시장가격·실적·목표가·뉴스는 먼저 조회된 자료만 표시하고 미수집 항목은 명확히 구분합니다.')
+    st.write('**종목별 핵심 지표와 관리 포인트를 카드형 PDF**로 정리합니다. 먼저 가격·기업분석·뉴스를 조회해야 내용이 채워집니다. 자료가 없는 항목은 임의로 작성하지 않습니다.')
     st.caption('기업 전망을 임의 작성하거나 단순 뉴스 제목으로 매매를 권고하지 않습니다. 모든 데이터는 출처·기준시점 확인과 준법 검토가 필요합니다.')
     symbols_for_report=list(dict.fromkeys(positions.sort_values('평가액(원)',ascending=False,na_position='last')['티커'].astype(str).tolist()))
     quotes_for_report={**st.session_state.get('quotes',{}),**st.session_state.get('report_quotes',{})}
     research_for_report=st.session_state.get('deep_research',{})
     news_for_report=st.session_state.get('news_map',{})
-    covered_prices=sum(bool(quotes_for_report.get(t)) for t in symbols_for_report)
-    covered_deep=sum(bool(research_for_report.get(t)) for t in symbols_for_report)
+    def has_analysis_data(result):
+        if not isinstance(result,dict): return False
+        info=result.get('info') or {}
+        keys=('trailingPE','forwardPE','returnOnEquity','revenueGrowth','totalRevenue','marketCap')
+        if isinstance(info,dict) and any(_numeric(info.get(k)) is not None for k in keys):return True
+        if result.get('quarters'): return True
+        targets=result.get('analyst_targets') or {}
+        return isinstance(targets,dict) and _numeric(targets.get('mean')) is not None
+    covered_prices=sum(_numeric((quotes_for_report.get(t) or {}).get('price')) is not None or
+                       _numeric((research_for_report.get(t) or {}).get('quote',{}).get('price')) is not None
+                       for t in symbols_for_report)
+    covered_deep=sum(has_analysis_data(research_for_report.get(t)) for t in symbols_for_report)
     covered_news=sum(bool(news_for_report.get(t)) for t in symbols_for_report)
     metrics=st.columns(3)
     metrics[0].metric('시장 추세 수집',f'{covered_prices}/{len(symbols_for_report)}')
-    metrics[1].metric('기업 심층분석',f'{covered_deep}/{len(symbols_for_report)}')
+    metrics[1].metric('재무·실적 확보',f'{covered_deep}/{len(symbols_for_report)}')
     metrics[2].metric('최근 뉴스',f'{covered_news}/{len(symbols_for_report)}')
     st.markdown('#### 보고서용 자료 수집')
     st.caption('외부에는 공개 티커·종목명만 조회하며 고객별칭·수량·매입단가는 전송하지 않습니다. 시세 조회는 엑셀 기준가 평가액을 자동으로 변경하지 않습니다.')
@@ -912,38 +925,58 @@ with tab_report:
                             for e in failed[:70]:st.write(str(e))
                 except Exception as e:st.error(f'시세 조회 실패: {str(e)[:200]}')
     with cdeep:
-        analysis_count=st.selectbox('상위 종목 기업분석 개수',[3,5,10,20],index=1,help='시세·재무·컨센서스를 종목별로 요청합니다. 20종목은 시간이 오래 걸릴 수 있습니다.')
-        if st.button('② 선택 수만큼 기업분석 수집',use_container_width=True):
-            targets=symbols_for_report[:analysis_count]
-            bar=st.progress(0,text='기업분석 수집 시작')
-            successes=0
-            for idx,t in enumerate(targets,1):
-                is_etf=bool(positions.loc[positions['티커']==t,'종목유형'].astype(str).str.upper().str.contains('ETF').any())
-                try:
-                    st.session_state['deep_research'][t]=fetch_selected_research(t,is_etf)
-                    successes+=1
-                except Exception as e:
-                    st.session_state['deep_research'][t]={'error':str(e)[:150],'errors':['자료 수집 실패']}
-                bar.progress(idx/len(targets),text=f'기업분석 {idx}/{len(targets)}')
-            st.session_state.pop('pdf_bytes',None)
-            st.success(f'{successes}개 종목 수집 요청 완료. 실제 데이터 제공 여부는 종목별로 다릅니다.')
+        analysis_count=st.selectbox('한 번에 조회할 기업 수',[5,10,20],index=1,
+            help='최상위 종목부터 이미 조회한 종목을 건너뛰고 다음 미조회 종목으로 이어집니다.')
+        retry_empty=st.checkbox('자료 없는 종목 재시도',value=False,
+            help='체크하면 과거 요청했지만 재무지표가 확보되지 않은 종목부터 재조회합니다.')
+        if st.button('② 다음 미조회 기업 분석',use_container_width=True):
+            attempted=set(st.session_state.get('attempted_research',[])) | set(st.session_state.get('deep_research',{}))
+            if retry_empty:
+                candidates=[t for t in symbols_for_report if not has_analysis_data(st.session_state['deep_research'].get(t))]
+            else:
+                candidates=[t for t in symbols_for_report if t not in attempted]
+            targets=candidates[:analysis_count]
+            if not targets:
+                st.info('새로 조회할 종목이 없습니다. 재조회가 필요하다면 자료 없는 종목 재시도를 선택하세요.')
+            else:
+                bar=st.progress(0,text='기업분석 수집 시작')
+                successes=0
+                for idx,t in enumerate(targets,1):
+                    is_etf=bool(positions.loc[positions['티커']==t,'종목유형'].astype(str).str.upper().str.contains('ETF').any())
+                    try:
+                        result=fetch_selected_research(t,is_etf)
+                        st.session_state['deep_research'][t]=result
+                        if has_analysis_data(result):successes+=1
+                    except Exception as e:
+                        st.session_state['deep_research'][t]={'error':str(e)[:150],'errors':['자료 수집 실패']}
+                    if t not in st.session_state['attempted_research']:
+                        st.session_state['attempted_research'].append(t)
+                    bar.progress(idx/len(targets),text=f'기업분석 {idx}/{len(targets)}')
+                st.session_state.pop('pdf_bytes',None)
+                st.success(f'{len(targets)}개 종목 조회 시도 · 유효한 기업 지표 {successes}개 · 누적 조회 시도 {len(st.session_state["attempted_research"])}개')
     with cnews:
-        news_count=st.selectbox('뉴스 조회 대상 종목 수',[5,10,20,40,60],index=1)
-        if st.button('③ 선택 수만큼 뉴스 수집',use_container_width=True):
-            pairs=[]
-            for t in symbols_for_report[:news_count]:
-                r=positions.loc[positions['티커']==t].iloc[0]
-                pairs.append((t,str(r.get('종목명') or r.get('종목코드'))))
-            with st.spinner('뉴스 RSS 수집 중'):
-                try:
-                    new_items,failed=fetch_news_batch(pairs,max_workers=4)
-                    st.session_state['news_map'].update(new_items)
-                    st.session_state.pop('pdf_bytes',None)
-                    st.success(f'{len(new_items)}종목 조회, 결과 없음 {len(failed)}종목')
-                except Exception as e:st.error(f'뉴스 수집 실패: {str(e)[:160]}')
+        news_count=st.selectbox('한 번에 뉴스 조회할 종목 수',[5,10,20],index=1)
+        if st.button('③ 다음 미조회 뉴스 수집',use_container_width=True):
+            targets=[t for t in symbols_for_report if t not in st.session_state['news_map']][:news_count]
+            if not targets:
+                st.info('모든 종목의 뉴스 조회를 한 번 이상 시도했습니다. 새로 조회하려면 뉴스 모니터링 탭을 이용하세요.')
+            else:
+                pairs=[]
+                for t in targets:
+                    r=positions.loc[positions['티커']==t].iloc[0]
+                    pairs.append((t,str(r.get('종목명') or r.get('종목코드'))))
+                with st.spinner(f'{len(pairs)}종목 뉴스 RSS 수집 중'):
+                    try:
+                        new_items,failed=fetch_news_batch(pairs,max_workers=4)
+                        st.session_state['news_map'].update(new_items)
+                        st.session_state.pop('pdf_bytes',None)
+                        st.success(f'{len(new_items)}개 종목 뉴스 조회 · 기사 확보 {len(new_items)-len(failed)}종목 · 기사 없음/오류 {len(failed)}종목')
+                    except Exception as e:st.error(f'뉴스 수집 실패: {str(e)[:160]}')
     st.divider()
-    st.caption('**권장 순서:** ① 가격·추세 → ② 핵심 5~10개 기업 심층분석 → ③ 뉴스 → ④ PDF 생성. 전 종목은 각각 보유현황과 현재 수집된 자료로 분석 카드가 생성됩니다.')
-    if st.button('④ 📄 전 종목 개별 분석 PDF 생성',type='primary'):
+    st.caption('**권장 순서:** ① 가격·추세 수집 → ② 다음 미조회 기업분석(필요한 만큼 반복) → ③ 다음 미조회 뉴스(필요한 만큼 반복) → ④ PDF 생성. 데이터가 부족해도 PDF는 생성되지만 전망을 자동으로 만들어 채우지는 않습니다.')
+    if covered_deep==0 and covered_news==0:
+        st.warning('실적·컨센서스·뉴스 자료가 0건입니다. 지금 PDF를 만들면 평가액과 가격추세 중심의 요약만 나타납니다. ②·③ 자료 수집을 먼저 권장합니다.')
+    if st.button('④ 📄 카드형 종목 분석 PDF 생성',type='primary'):
         try:
             from pdf_report import build_pdf  # PDF 기능을 사용할 때만 의존성 로드
             st.session_state['pdf_bytes']=build_pdf(positions,price_mode,fx_source,st.session_state['is_demo'],
@@ -966,4 +999,4 @@ with tab_report:
     st.markdown('• 데이터 제공사의 라이선스 및 대외 재배포 가능 여부  \n• 고객정보 처리 및 전산 보안 승인 여부  \n• 목표가·증권사 의견 인용의 적법성 및 근거 출처  \n• 고객 제공자료의 준법 검토 및 버전 이력 관리')
 
 st.divider()
-st.caption('HanaV Private Portfolio V1.0.6 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
+st.caption('HanaV Private Portfolio V1.0.7 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
