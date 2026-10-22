@@ -9,6 +9,7 @@ import math
 import pandas as pd
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
@@ -17,23 +18,44 @@ from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate,Paragraph,Spacer,Table,TableStyle,PageBreak,KeepTogether
 from core import portfolio_summary, risk_findings, build_individual_note
 
-FONT_PATHS=[
-  '/usr/share/fonts/truetype/nanum/NanumGothic.ttf',
-  '/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf',
-  '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
-  os.path.join(os.environ.get('WINDIR','C:\\Windows'),'Fonts','malgun.ttf'),
-  os.path.join(os.environ.get('LOCALAPPDATA',''),'Microsoft','Windows','Fonts','NanumGothic.ttf')
+# Korean fonts installed at OS-level; in Streamlit Cloud see packages.txt.
+# The font binary is never included in this repository.
+FONT_PATHS = [
+    # Debian/Ubuntu: apt install fonts-nanum
+    '/usr/share/fonts/truetype/nanum/NanumGothic.ttf',
+    '/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf',
+    '/usr/share/fonts/truetype/nanum/NanumMyeongjo.ttf',
+    # Some distributions install Korean fonts elsewhere
+    '/usr/share/fonts/truetype/noto/NotoSansKR-Regular.ttf',
+    '/usr/local/share/fonts/NanumGothic.ttf',
+    os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts', 'malgun.ttf'),
+    os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts', 'NanumGothic.ttf'),
+    os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'Windows', 'Fonts', 'NanumGothic.ttf'),
 ]
 
+
 def register_font():
-    if 'HANAV_KO' in pdfmetrics.getRegisteredFontNames():return 'HANAV_KO'
+    """Use an embeddable Korean TTF whenever available.
+
+    Last-resort built-in CID font is only a fallback; it may be substituted in
+    some PDF readers. The recommended Cloud path is packages.txt/fonts-nanum.
+    """
+    registered = set(pdfmetrics.getRegisteredFontNames())
+    if 'HANAV_KO' in registered:
+        return 'HANAV_KO'
     for path in FONT_PATHS:
-        if not Path(path).is_file():continue
+        if not Path(path).is_file():
+            continue
         try:
-            pdfmetrics.registerFont(TTFont('HANAV_KO',path))
+            pdfmetrics.registerFont(TTFont('HANAV_KO', path))
             return 'HANAV_KO'
-        except Exception:continue
-    raise RuntimeError('한글 PDF 글꼴을 찾지 못했습니다. Windows 맑은 고딕 또는 나눔고딕 설치가 필요합니다. CSV 내보내기는 가능합니다.')
+        except (Exception):
+            continue
+    # A PDF should still be exportable even when an apt install was skipped.
+    # This fallback doesn't embed glyph outlines; viewers may substitute fonts.
+    if 'HYGothic-Medium' not in registered:
+        pdfmetrics.registerFont(UnicodeCIDFont('HYGothic-Medium'))
+    return 'HYGothic-Medium'
 
 def fmt(v,d=0):
     try:return f'{float(v):,.{d}f}' if pd.notna(v) else '—'
