@@ -13,7 +13,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 from core import COLUMNS,normalize_portfolio,enrich_positions,portfolio_summary,risk_findings,build_individual_note,to_csv_bytes
 from services import fetch_history_batch,fetch_fx_krw_per_usd,fetch_google_news,fetch_news_batch
-from pdf_report import build_pdf
 
 st.set_page_config(page_title='HanaV Private Portfolio',page_icon='💠',layout='wide',initial_sidebar_state='expanded')
 st.markdown('''<style>
@@ -73,11 +72,56 @@ def cached_news(ticker,name):
 def cached_fx():
     return fetch_fx_krw_per_usd()
 
+# Online deployment resilience: Github uploads sometimes omit the samples/ folder.
+# The fallback contains ONLY synthetic demonstration rows, never real customer data.
+import base64
+import zlib
+_EMBEDDED_DEMO = (
+    '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'
+    'vwG6yvB8'
+)
+
 @st.cache_data(show_spinner=False)
 def load_demo():
-    return pd.read_csv(os.path.join(os.path.dirname(__file__),'samples','demo_65.csv'),dtype={'종목코드':str})
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'samples', 'demo_65.csv')
+    if os.path.isfile(path):
+        try:
+            return pd.read_csv(path, dtype={'종목코드': str})
+        except (OSError, UnicodeError, pd.errors.ParserError, ValueError):
+            pass
+    # The ZIP includes the CSV too. This embedded copy makes the web app work
+    # even when the GitHub repo was created from a partial upload.
+    raw = zlib.decompress(base64.b64decode(_EMBEDDED_DEMO))
+    return pd.read_csv(BytesIO(raw), dtype={'종목코드': str})
 
-st.session_state.setdefault('portfolio_raw',load_demo())
+if 'portfolio_raw' not in st.session_state:
+    st.session_state['portfolio_raw'] = load_demo()
 st.session_state.setdefault('is_demo',True)
 st.session_state.setdefault('uploaded_hash','')
 st.session_state.setdefault('upload_rev',0)
@@ -89,7 +133,7 @@ st.session_state.setdefault('fx_source','가상 환율' if st.session_state['is_
 
 with st.sidebar:
     st.markdown('## 💠 HanaV Private')
-    st.caption('Portfolio Intelligence | V1.0')
+    st.caption('Portfolio Intelligence | V1.0.2')
     if st.button('로그아웃',use_container_width=True):
         # Completely clear current browser session's customer-position data.
         st.session_state.clear()
@@ -170,6 +214,8 @@ with st.sidebar:
 
 st.markdown('<div class="hero"><div class="kicker">PREMIER PORTFOLIO INTELLIGENCE</div><h1>HanaV Private Portfolio</h1><p>60+ holdings · Family views · Risk monitor · Research briefing · PDF report</p></div>',unsafe_allow_html=True)
 if st.session_state['is_demo']:
+    if not os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'samples', 'demo_65.csv')):
+        st.info('GitHub에 samples/demo_65.csv 파일이 없어 내장된 가상 65종목 데모를 사용합니다. 프로그램 실행에는 문제가 없습니다.')
     st.warning('현재 **가상 65종목 시연 데이터**입니다. 가격·수량·환율·평가금액은 실제 고객 보유자산이나 실시간 가격이 아닙니다.',icon='🧪')
 else:
     st.info('실제 계좌정보는 입력하지 마세요. 고객별칭만 사용하며 본 버전은 내부 테스트용입니다.',icon='🔒')
@@ -330,9 +376,14 @@ with tab_report:
     st.caption('매매 추천, AI가 생성한 허구의 목표가, 근거 없는 전망은 포함하지 않습니다. 고객 대외 전달 전 내부 승인 필요.')
     if st.button('📄 PDF 보고서 생성',type='primary'):
         try:
+            from pdf_report import build_pdf  # PDF 기능을 사용할 때만 의존성 로드
             st.session_state['pdf_bytes']=build_pdf(positions,price_mode,fx_source,st.session_state['is_demo'])
             st.session_state['pdf_scope']=scope
             st.success('보고서가 생성됐습니다.')
+        except ModuleNotFoundError as e:
+            if e.name=='reportlab':
+                st.error(r'PDF 생성에 필요한 reportlab 패키지가 설치되지 않았습니다. 앱 폴더에서 .\.venv\Scripts\python.exe -m pip install reportlab 을 실행하세요.')
+            else:st.error(f'PDF 모듈 오류: {e}')
         except Exception as e:st.error(f'PDF 생성 오류: {e}')
     if 'pdf_bytes' in st.session_state:
         st.download_button('⬇ PDF 다운로드',data=st.session_state['pdf_bytes'],file_name=f'hanav_private_{datetime.now():%Y%m%d}.pdf',mime='application/pdf',use_container_width=True)
@@ -343,4 +394,4 @@ with tab_report:
     st.markdown('• 데이터 제공사의 라이선스 및 대외 재배포 가능 여부  \n• 고객정보 처리 및 전산 보안 승인 여부  \n• 목표가·증권사 의견 인용의 적법성 및 근거 출처  \n• 고객 제공자료의 준법 검토 및 버전 이력 관리')
 
 st.divider()
-st.caption('HanaV Private Portfolio V1 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
+st.caption('HanaV Private Portfolio V1.0.2 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
