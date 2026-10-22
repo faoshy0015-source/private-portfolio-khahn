@@ -16,7 +16,7 @@ from services import fetch_history_batch,fetch_fx_krw_per_usd,fetch_google_news,
 
 st.set_page_config(page_title='HanaV Private Portfolio',page_icon='💠',layout='wide',initial_sidebar_state='expanded')
 st.markdown('''<style>
-/* HanaV Private Portfolio V1.0.7 — refined premium jade theme.
+/* HanaV Private Portfolio V1.0.9 — refined premium jade theme.
    This visual layer intentionally works even if GitHub retains the old dark
    .streamlit/config.toml. No changes to financial calculations or uploads. */
 :root {
@@ -550,7 +550,7 @@ st.session_state.setdefault('fx_source','가상 환율' if st.session_state['is_
 
 with st.sidebar:
     st.markdown('## 💠 HanaV Private')
-    st.caption('Portfolio Intelligence | V1.0.7')
+    st.caption('Portfolio Intelligence | V1.0.9')
     if st.button('로그아웃',use_container_width=True):
         # Completely clear current browser session's customer-position data.
         st.session_state.clear()
@@ -886,7 +886,7 @@ with tab_news:
 
 with tab_report:
     st.subheader('전담 포트폴리오 정기 점검 보고서')
-    st.write('**종목별 핵심 지표와 관리 포인트를 카드형 PDF**로 정리합니다. 먼저 가격·기업분석·뉴스를 조회해야 내용이 채워집니다. 자료가 없는 항목은 임의로 작성하지 않습니다.')
+    st.write('**트리맵 · 전 종목 수익률 히트맵 · 업종/고객별 자산 분포**를 앞부분에 보여주고, 뒤에는 종목별 심층 분석 카드를 첨부합니다. 뉴스·실적은 수집된 항목만 반영합니다.')
     st.caption('기업 전망을 임의 작성하거나 단순 뉴스 제목으로 매매를 권고하지 않습니다. 모든 데이터는 출처·기준시점 확인과 준법 검토가 필요합니다.')
     symbols_for_report=list(dict.fromkeys(positions.sort_values('평가액(원)',ascending=False,na_position='last')['티커'].astype(str).tolist()))
     quotes_for_report={**st.session_state.get('quotes',{}),**st.session_state.get('report_quotes',{})}
@@ -976,7 +976,7 @@ with tab_report:
     st.caption('**권장 순서:** ① 가격·추세 수집 → ② 다음 미조회 기업분석(필요한 만큼 반복) → ③ 다음 미조회 뉴스(필요한 만큼 반복) → ④ PDF 생성. 데이터가 부족해도 PDF는 생성되지만 전망을 자동으로 만들어 채우지는 않습니다.')
     if covered_deep==0 and covered_news==0:
         st.warning('실적·컨센서스·뉴스 자료가 0건입니다. 지금 PDF를 만들면 평가액과 가격추세 중심의 요약만 나타납니다. ②·③ 자료 수집을 먼저 권장합니다.')
-    if st.button('④ 📄 카드형 종목 분석 PDF 생성',type='primary'):
+    if st.button('④ 📄 시각형 포트폴리오 PDF 생성',type='primary'):
         try:
             from pdf_report import build_pdf  # PDF 기능을 사용할 때만 의존성 로드
             st.session_state['pdf_bytes']=build_pdf(positions,price_mode,fx_source,st.session_state['is_demo'],
@@ -999,4 +999,4 @@ with tab_report:
     st.markdown('• 데이터 제공사의 라이선스 및 대외 재배포 가능 여부  \n• 고객정보 처리 및 전산 보안 승인 여부  \n• 목표가·증권사 의견 인용의 적법성 및 근거 출처  \n• 고객 제공자료의 준법 검토 및 버전 이력 관리')
 
 st.divider()
-st.caption('HanaV Private Portfolio V1.0.7 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
+st.caption('HanaV Private Portfolio V1.0.9 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
