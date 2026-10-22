@@ -1,240 +1,425 @@
-"""Local PDF export. No data transmitted or persisted."""
+"""Premium, evidence-first portfolio PDF. No third-party requests or persistence.
+
+Builds from account valuation and market research already retrieved by the Streamlit app.
+Never imputes missing forecasts or substitutes purchase price for market data.
+"""
 from __future__ import annotations
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from xml.sax.saxutils import escape
 from urllib.parse import urlsplit
-import os
+from xml.sax.saxutils import escape
 import math
+import os
 import pandas as pd
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
-from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate,Paragraph,Spacer,Table,TableStyle,PageBreak,KeepTogether,HRFlowable
-from core import portfolio_summary, risk_findings, build_individual_note
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+    KeepTogether, HRFlowable,
+)
+from core import portfolio_summary, risk_findings
 
-# Korean fonts installed at OS-level; in Streamlit Cloud see packages.txt.
-# The font binary is never included in this repository.
+BASE = colors.HexColor('#14664C')
+DARK = colors.HexColor('#162A26')
+MUTED = colors.HexColor('#64766E')
+PALE = colors.HexColor('#EDF6F1')
+PANEL = colors.HexColor('#F7FAF8')
+LINE = colors.HexColor('#D5E4DC')
+AMBER = colors.HexColor('#A46817')
+
 FONT_PATHS = [
-    # Debian/Ubuntu: apt install fonts-nanum
-    '/usr/share/fonts/truetype/nanum/NanumGothic.ttf',
-    '/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf',
-    '/usr/share/fonts/truetype/nanum/NanumMyeongjo.ttf',
-    # Some distributions install Korean fonts elsewhere
-    '/usr/share/fonts/truetype/noto/NotoSansKR-Regular.ttf',
-    '/usr/local/share/fonts/NanumGothic.ttf',
-    os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts', 'malgun.ttf'),
-    os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts', 'NanumGothic.ttf'),
-    os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'Windows', 'Fonts', 'NanumGothic.ttf'),
+    ('/usr/share/fonts/truetype/nanum/NanumGothic.ttf', '/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf'),
+    ('/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf', '/usr/share/fonts/truetype/nanum/NanumBarunGothicBold.ttf'),
+    ('/usr/share/fonts/truetype/noto/NotoSansKR-Regular.ttf', None),
+    (os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts', 'malgun.ttf'),
+     os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts', 'malgunbd.ttf')),
+    (os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'Windows', 'Fonts', 'NanumGothic.ttf'), None),
 ]
 
 
 def register_font():
-    """Use an embeddable Korean TTF whenever available.
-
-    Last-resort built-in CID font is only a fallback; it may be substituted in
-    some PDF readers. The recommended Cloud path is packages.txt/fonts-nanum.
-    """
-    registered = set(pdfmetrics.getRegisteredFontNames())
-    if 'HANAV_KO' in registered:
-        return 'HANAV_KO'
-    for path in FONT_PATHS:
-        if not Path(path).is_file():
-            continue
-        try:
-            pdfmetrics.registerFont(TTFont('HANAV_KO', path))
-            return 'HANAV_KO'
-        except (Exception):
-            continue
-    # A PDF should still be exportable even when an apt install was skipped.
-    # This fallback doesn't embed glyph outlines; viewers may substitute fonts.
-    if 'HYGothic-Medium' not in registered:
+    """Use host-installed Korean font; NEVER redistribute font binaries."""
+    existing = set(pdfmetrics.getRegisteredFontNames())
+    if 'HVP' in existing:
+        return 'HVP', ('HVPB' if 'HVPB' in existing else 'HVP')
+    for regular, bold in FONT_PATHS:
+        if Path(regular).is_file():
+            try:
+                pdfmetrics.registerFont(TTFont('HVP', regular))
+                if bold and Path(bold).is_file():
+                    pdfmetrics.registerFont(TTFont('HVPB', bold))
+                    bold_name = 'HVPB'
+                else:
+                    bold_name = 'HVP'
+                pdfmetrics.registerFontFamily('HVP', normal='HVP', bold=bold_name)
+                return 'HVP', bold_name
+            except Exception:
+                continue
+    if 'HYGothic-Medium' not in existing:
         pdfmetrics.registerFont(UnicodeCIDFont('HYGothic-Medium'))
-    return 'HYGothic-Medium'
+    return 'HYGothic-Medium', 'HYGothic-Medium'
 
-def fmt(v,d=0):
-    try:return f'{float(v):,.{d}f}' if pd.notna(v) else '—'
-    except Exception:return '—'
 
-def build_pdf(df:pd.DataFrame,mode:str,fx_source:str,demo:bool=False,
-              research_map:dict|None=None,news_map:dict|None=None,quote_map:dict|None=None)->bytes:
+def number(val):
+    try:
+        x = float(val)
+        return x if math.isfinite(x) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def txt(val, default='미수집'):
+    if val is None: return default
+    x = str(val).strip()
+    return x if x and x.lower() not in ('nan', 'none', 'nat') else default
+
+
+def fmt(val, digits=0, suffix=''):
+    v = number(val)
+    return f'{v:,.{digits}f}{suffix}' if v is not None else '—'
+
+
+def pct(val):
+    v = number(val)
+    return f'{v:+.1f}%' if v is not None else '—'
+
+
+def won(val):
+    v = number(val)
+    if v is None: return '평가 불가'
+    if abs(v) >= 1e8: return f'{v/1e8:,.2f}억 원'
+    if abs(v) >= 1e4: return f'{v/1e4:,.0f}만 원'
+    return f'{v:,.0f}원'
+
+
+def valid_url(url):
+    try:
+        p = urlsplit(str(url).strip())
+        return p.scheme == 'https' and bool(p.hostname)
+    except Exception:
+        return False
+
+
+def has_fundamentals(r):
+    if not isinstance(r, dict): return False
+    i = r.get('info') or {}
+    keys = ('trailingPE','forwardPE','returnOnEquity','revenueGrowth','profitMargins','totalRevenue','marketCap')
+    info_found = isinstance(i, dict) and any(number(i.get(k)) is not None for k in keys)
+    quarters = bool(r.get('quarters'))
+    target = isinstance(r.get('analyst_targets'), dict) and number(r['analyst_targets'].get('mean')) is not None
+    return info_found or quarters or target
+
+
+def styles(font, bold):
+    s={}
+    def add(k, **kw):
+        s[k] = ParagraphStyle(name='HVP_'+k, fontName=kw.pop('fontName',font),
+                              fontSize=kw.pop('fontSize',8.5), leading=kw.pop('leading',13),
+                              textColor=kw.pop('textColor',DARK), spaceAfter=0, **kw)
+    add('brand',fontName=bold,fontSize=11,leading=15,textColor=BASE)
+    add('main',fontName=bold,fontSize=19,leading=26)
+    add('section',fontName=bold,fontSize=13,leading=20)
+    add('cardtitle',fontName=bold,fontSize=13.2,leading=18)
+    add('micro',fontSize=8.0,leading=12,textColor=MUTED)
+    add('normal',fontSize=8.6,leading=13.4)
+    add('body',fontSize=8.9,leading=14)
+    add('small',fontSize=8.6,leading=13.2)
+    add('smallgreen',fontName=bold,fontSize=8.6,leading=12.5,textColor=BASE)
+    add('label',fontName=bold,fontSize=8.0,leading=12,textColor=MUTED)
+    add('number',fontName=bold,fontSize=13.1,leading=18)
+    add('tablehead',fontName=bold,fontSize=7.3,leading=10,textColor=colors.white)
+    add('tablecell',fontSize=7.4,leading=11)
+    add('center',fontSize=8.3,leading=13.1,alignment=TA_CENTER)
+    return s
+
+
+def build_pdf(df:pd.DataFrame, mode:str, fx_source:str, demo:bool=False,
+              research_map:dict|None=None, news_map:dict|None=None, quote_map:dict|None=None)->bytes:
     research_map=research_map or {}
     news_map=news_map or {}
     quote_map=quote_map or {}
-    font=register_font()
+    font,bold=register_font()
+    st=styles(font,bold)
     buff=BytesIO()
-    doc=SimpleDocTemplate(buff,pagesize=A4,topMargin=17*mm,bottomMargin=16*mm,leftMargin=17*mm,rightMargin=17*mm,
-                          title='HanaV Private Portfolio 분석보고서',author='HanaV Private Portfolio')
-    green=colors.HexColor('#087D57'); dark=colors.HexColor('#162A25'); grey=colors.HexColor('#65736E')
-    sty=getSampleStyleSheet()
-    sty.add(ParagraphStyle(name='HKTitle',fontName=font,fontSize=18,leading=26,textColor=green,spaceAfter=6))
-    sty.add(ParagraphStyle(name='HKHead',fontName=font,fontSize=11,leading=16,textColor=dark,spaceBefore=12,spaceAfter=6))
-    sty.add(ParagraphStyle(name='HKNormal',fontName=font,fontSize=8.7,leading=14,textColor=dark,spaceAfter=5))
-    sty.add(ParagraphStyle(name='HKSmall',fontName=font,fontSize=7,leading=11,textColor=grey,spaceAfter=5))
-    sty.add(ParagraphStyle(name='HKDetail',fontName=font,fontSize=7.8,leading=12.2,textColor=dark,spaceAfter=4))
-    sty.add(ParagraphStyle(name='HKSub',fontName=font,fontSize=7.4,leading=11.4,textColor=green,spaceAfter=4))
-    cell=ParagraphStyle(name='HKCell',fontName=font,fontSize=7,leading=10,textColor=dark)
-    headercell=ParagraphStyle(name='HKHeaderCell',fontName=font,fontSize=7,leading=10,textColor=colors.white)
-    def par(s,style='HKNormal'):return Paragraph(escape(str(s)),sty[style])
-    def pc(s,header=False):return Paragraph(escape(str(s)),headercell if header else cell)
-    m=portfolio_summary(df); flow=[]
-    flow.append(par('HANAV PRIVATE PORTFOLIO','HKTitle'))
-    flow.append(par('VVIP 자산 현황 및 리스크 모니터링 리포트','HKHead'))
-    flow.append(par(f"발행일 {datetime.now().strftime('%Y-%m-%d %H:%M')} | 가격모드: {mode} | 환율: {fx_source}",'HKSmall'))
-    if demo:flow.append(par('가상 시뮬레이션 데이터입니다. 실제 자산·가격·수익이 아닙니다.','HKHead'))
-    flow.append(par(f"보유 포지션 {m['positions']:,}개 · 구분 계정 {m['clients']:,}개 · 원화 평가 가능 {m['positions']-m['unconverted']:,}개"))
-    flow.append(par(f"평가가능 금액 합계 {fmt(m['value_krw'])}원" + (' (일부 포지션 누락, 전체 자산 합계 아님)' if not m['complete_total'] else '')))
-    if not pd.isna(m['gain_krw']):flow.append(par(f"입력 매입단가 기준 평가손익 {fmt(m['gain_krw'])}원 / 손익률 {fmt(m['profit_pct'],2)}% (배당·수수료·실현손익 제외)"))
-    flow.append(par('주요 점검사항','HKHead'))
-    for x in risk_findings(df):flow.append(par('• '+x))
-    total_tickers=df['티커'].astype(str).nunique() if '티커' in df else len(df)
-    covered_quotes=sum(t in quote_map and bool(quote_map[t]) for t in df['티커'].astype(str).unique()) if '티커' in df else 0
-    covered_deep=sum(t in research_map and bool(research_map[t]) for t in df['티커'].astype(str).unique()) if '티커' in df else 0
-    covered_news=sum(t in news_map and bool(news_map[t]) for t in df['티커'].astype(str).unique()) if '티커' in df else 0
-    flow.append(par(f'시장자료 수집 현황: 가격추세 {covered_quotes}/{total_tickers}종목 · 기업분석 {covered_deep}/{total_tickers}종목 · 뉴스 {covered_news}/{total_tickers}종목','HKSmall'))
-    flow.append(par('종목별 평가 현황','HKHead'))
-    headers=['고객별칭','종목','수량','현재가','평가액(원)','비중','관리상태']
-    rows=[[pc(h,True) for h in headers]]
+    doc=SimpleDocTemplate(buff,pagesize=A4,
+        leftMargin=17*mm,rightMargin=17*mm,topMargin=18*mm,bottomMargin=17*mm,
+        title='HanaV Private Portfolio | 포트폴리오 점검 리포트',
+        author='HanaV Private Portfolio')
+    W=A4[0]-34*mm
+    flow=[]
+    now=datetime.now().strftime('%Y.%m.%d %H:%M')
+    def p(value,style='normal',limit=None):
+        value=txt(value,'—')
+        if limit and len(value)>limit:value=value[:limit-1]+'…'
+        return Paragraph(escape(value),st[style])
+    def title(s):
+        flow.append(p(s,'section')); flow.append(Spacer(1,3*mm))
+    def sectiontable(headers, rowcells, widths, aligns=None):
+        data=[[p(h,'tablehead') for h in headers]]
+        data.extend([[p(x,'tablecell') for x in row] for row in rowcells])
+        t=Table(data,colWidths=widths,repeatRows=1,hAlign='LEFT')
+        rules=[('BACKGROUND',(0,0),(-1,0),BASE),
+               ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,PANEL]),
+               ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+               ('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5),
+               ('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),4),
+               ('LINEBELOW',(0,0),(-1,0),0.4,BASE),
+               ('LINEBELOW',(0,1),(-1,-2),0.22,LINE)]
+        for i in (aligns or []):rules.append(('ALIGN',(i,1),(i,-1),'RIGHT'))
+        t.setStyle(TableStyle(rules))
+        return t
+
+    m=portfolio_summary(df)
     sorted_df=df.sort_values('평가액(원)',ascending=False,na_position='last')
-    for _,r in sorted_df.iterrows():
-        label=str(r['종목명']).strip() or str(r['종목코드'])
-        if len(label)>21:label=label[:19]+'…'
-        rows.append([pc(str(r['고객구분'])[:8]),pc(label),pc(fmt(r['보유수량'])),pc(fmt(r['현재가'],2)),pc(fmt(r['평가액(원)'])),pc(fmt(r['평가액비중(%)'],1)+'%'),pc(str(r['모니터링'])[:12])])
-    tbl=Table(rows,colWidths=[23*mm,36*mm,17*mm,23*mm,30*mm,15*mm,31*mm],repeatRows=1,hAlign='LEFT')
-    tbl.setStyle(TableStyle([
-       ('BACKGROUND',(0,0),(-1,0),green),('TEXTCOLOR',(0,0),(-1,0),colors.white),
-       ('VALIGN',(0,0),(-1,-1),'MIDDLE'),('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#F2F7F5')]),
-       ('LINEBELOW',(0,0),(-1,0),0.5,green),('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6),
-       ('LEFTPADDING',(0,0),(-1,-1),4),('RIGHTPADDING',(0,0),(-1,-1),4),
-    ]))
-    flow.append(tbl)
+    tickers=list(dict.fromkeys(df['티커'].astype(str))) if '티커' in df else []
+    n=len(tickers)
+    coverprice=sum(number((research_map.get(t) or {}).get('quote',{}).get('price')) is not None or number((quote_map.get(t) or {}).get('price')) is not None for t in tickers)
+    coverdeep=sum(has_fundamentals(research_map.get(t)) for t in tickers)
+    covernews=sum(bool(news_map.get(t)) for t in tickers)
+
+    # Page 1: decision-useful, legible executive dashboard.
+    flow.append(p('HANAV  /  PRIVATE PORTFOLIO','brand'))
+    flow.append(Spacer(1,2*mm))
+    flow.append(p('포트폴리오 정기 점검 리포트','main'))
+    flow.append(p(f'작성 {now}    |    평가가격 {mode}    |    환산 {fx_source}','micro'))
+    flow.append(Spacer(1,4*mm))
+    if demo:
+        demo_tbl=Table([[p('가상 65종목 시연 자료 · 실제 고객 자산 및 시장 분석 결과가 아닙니다.','smallgreen')]],colWidths=[W])
+        demo_tbl.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),colors.HexColor('#FFF4DC')),
+            ('BOX',(0,0),(-1,-1),0.5,colors.HexColor('#F0DCB2')),
+            ('LEFTPADDING',(0,0),(-1,-1),9),('TOPPADDING',(0,0),(-1,-1),8),('BOTTOMPADDING',(0,0),(-1,-1),8)]))
+        flow.append(demo_tbl);flow.append(Spacer(1,5*mm))
+
+    metrics=[('보유 포지션',f"{m['positions']:,}개"),('고객 구분',f"{m['clients']:,}개"),
+             ('평가 가능한 금액',won(m['value_krw'])),('평가 비중 최대',fmt(m['largest_weight'],1,'%'))]
+    metric_tbl=Table([[Table([[p(name,'label')],[p(value,'number')]],colWidths=[W/4-12],style=TableStyle([
+        ('BACKGROUND',(0,0),(-1,-1),PALE),('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),0),
+        ('TOPPADDING',(0,0),(-1,-1),1),('BOTTOMPADDING',(0,0),(-1,-1),1)])) for name,value in metrics]],
+        colWidths=[W/4]*4)
+    metric_tbl.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),PALE),('VALIGN',(0,0),(-1,-1),'TOP'),
+        ('TOPPADDING',(0,0),(-1,-1),12),('BOTTOMPADDING',(0,0),(-1,-1),11),
+        ('LEFTPADDING',(0,0),(-1,-1),9),('RIGHTPADDING',(0,0),(-1,-1),3),
+        ('INNERGRID',(0,0),(-1,-1),0.5,colors.white)]))
+    flow.append(metric_tbl)
+    flow.append(Spacer(1,4*mm))
+    if not m['complete_total']:
+        flow.append(p('주의: 일부 종목의 시세 또는 환율이 없어, 표시 금액과 비중은 확인 가능한 종목 기준입니다.','small'))
+        flow.append(Spacer(1,2*mm))
+    title('이번 보고서의 확인 사항')
+    findings=risk_findings(df)
+    for line in findings[:5]:
+        flow.append(p('•  '+line,'body'));flow.append(Spacer(1,2*mm))
+    flow.append(Spacer(1,4*mm))
+    title('데이터 준비 상태')
+    coverage=[('주가 추세',coverprice),('실적·밸류에이션',coverdeep),('최근 뉴스',covernews)]
+    cover_cells=[]
+    for label,num in coverage:
+        coverage_pct=100*num/n if n else 0
+        cover_cells.append(Table([[p(label,'label')],[p(f'{num}/{n}종목  ({coverage_pct:.0f}%)','number')]],
+            colWidths=[W/3-12],style=TableStyle([('BACKGROUND',(0,0),(-1,-1),PANEL),
+            ('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),0),
+            ('TOPPADDING',(0,0),(-1,-1),1),('BOTTOMPADDING',(0,0),(-1,-1),1)])))
+    cov=Table([cover_cells],colWidths=[W/3]*3)
+    cov.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),PANEL),
+        ('TOPPADDING',(0,0),(-1,-1),9),('BOTTOMPADDING',(0,0),(-1,-1),9),
+        ('LEFTPADDING',(0,0),(-1,-1),10),('INNERGRID',(0,0),(-1,-1),1,colors.white)]))
+    flow.append(cov);flow.append(Spacer(1,3*mm))
+    flow.append(p('PDF는 이미 조회된 자료만 사용합니다. 실적·목표가·뉴스가 비어 있다면 앱의 보고서 탭에서 해당 종목을 먼저 수집해야 합니다.','micro'))
+    flow.append(Spacer(1,6*mm))
+    title('보고서 해석 시 유의사항')
+    flow.append(p('보유 수익률은 입력한 매입단가·기준가에 따른 계산값이며 실현손익, 배당금, 거래비용을 반영하지 않습니다. 뉴스는 사실 검증 및 종목 관련성 확인이 필요하며, 공개 집계 목표가는 개별 기관의 발표일을 확인하지 않은 값입니다.','body'))
+
     flow.append(PageBreak())
-    flow.append(par('전 종목 개별 분석 카드','HKTitle'))
-    flow.append(par('보유 중인 모든 포지션을 순서대로 점검합니다. 자료가 부족한 항목은 미조회로 표시되며, 동일한 투자전략 문장을 자동 반복하지 않습니다.','HKSmall'))
-    flow.append(par('가격추세 및 업계 지표는 외부 공개 데이터 조회 성공 시에만 기입합니다. 엑셀 입력 기준가와 조회 종가를 혼동하지 마세요.','HKSmall'))
+    title('전 종목 보유 현황')
+    flow.append(p('평가금액이 큰 순서입니다. 종목 비중과 평가손익은 입력가격 또는 선택된 시세 기준입니다.','micro'))
+    flow.append(Spacer(1,3*mm))
+    rows=[]
+    for _,r in sorted_df.iterrows():
+        sym=txt(r.get('종목명'),txt(r.get('종목코드'),'—'))
+        rows.append([txt(r.get('고객구분'))[:10],sym[:20],fmt(r.get('보유수량')),won(r.get('평가액(원)')),
+                     fmt(r.get('평가액비중(%)'),1,'%'),txt(r.get('모니터링'),'정기 점검')[:18]])
+    col_widths=[20*mm,42*mm,20*mm,35*mm,17*mm,42*mm]
+    flow.append(sectiontable(['고객','종목','수량','평가액','비중','상태'],rows,col_widths,aligns=[2,3,4]))
+    flow.append(PageBreak())
 
-    def nonempty_number(value):
-        try:
-            f=float(value)
-            return f if math.isfinite(f) else None
-        except (TypeError,ValueError,OverflowError):
-            return None
+    def current_quote(res,quote):
+        candidate=res.get('quote') or {}
+        return candidate if number(candidate.get('price')) is not None else quote
 
-    def fmt_percent(value):
-        v=nonempty_number(value)
-        return f'{v:+.1f}%' if v is not None else '미조회'
+    def market_lines(q):
+        price=number(q.get('price'))
+        if price is None:
+            return ['공개 가격추세 미수집 · 입력 기준가와 구분하여 사용합니다.']
+        ch=[f"공개 종가 {fmt(price,2)} · {txt(q.get('date'))} · 1개월 {pct(q.get('ret_1m'))} / 3개월 {pct(q.get('ret_3m'))}"]
+        ma20=number(q.get('ma20')); ma60=number(q.get('ma60')); hi=number(q.get('high52'))
+        detail=[]
+        if ma20 is not None and ma60 is not None:
+            detail.append(f"20일선 {fmt(ma20,2)} / 60일선 {fmt(ma60,2)}")
+        if hi and hi>0:
+            detail.append(f"52주 종가 최고 대비 {pct((price/hi-1)*100)}")
+        if detail:ch.append(' · '.join(detail))
+        return ch
 
-    def text_value(value):
-        return str(value).strip() if value is not None and str(value).strip() and str(value).strip().lower()!='nan' else '미기재'
-
-    for serial,(_,r) in enumerate(sorted_df.iterrows(),1):
-        symbol=str(r.get('티커','')).strip()
-        label=text_value(r.get('종목명',''))
-        if label=='미기재':label=str(r['종목코드'])
-        res=research_map.get(symbol,{}) or {}
-        quoted=quote_map.get(symbol,{}) or {}
-        deep_quote=res.get('quote',{}) or {}
-        q=deep_quote if nonempty_number(deep_quote.get('price')) is not None else quoted
-        info=res.get('info',{}) or {}
-        targets=res.get('analyst_targets',{}) or {}
-        is_etf='ETF' in str(r.get('종목유형','')).upper()
-
-        parts=[par(f'{serial:02d}. {r["고객구분"]}  |  {label}  ({r["종목코드"]})','HKHead')]
-        valtxt=f"보유 {fmt(r.get('보유수량'))}주  ·  평가액 {fmt(r.get('평가액(원)'))}원  ·  비중 {fmt(r.get('평가액비중(%)'),1)}%"
-        parts.append(par(valtxt,'HKSub'))
-        pf_price=nonempty_number(r.get('현재가'))
-        src=text_value(r.get('가격출처'))
-        date=text_value(r.get('가격기준일'))
-        parts.append(par(f"[계좌 평가] 적용가격 {fmt(pf_price,2)} {r.get('통화','')}  |  기준 {date}  |  출처 {src}",'HKDetail'))
-        gain=nonempty_number(r.get('수익률(%)'))
-        if gain is not None:parts.append(par(f'[보유현황] 입력 매입단가 대비 미실현 손익률 {gain:+.1f}% (배당·실현손익·비용 제외)','HKDetail'))
-        else:parts.append(par('[보유현황] 매입단가 미제공으로 수익률 산정 보류','HKDetail'))
-
-        market_price=nonempty_number(q.get('price'))
-        if market_price is not None:
-            parts.append(par(f"[시장 추세] 조회 종가 {fmt(market_price,2)}  |  {text_value(q.get('date'))}  |  1개월 {fmt_percent(q.get('ret_1m'))}  /  3개월 {fmt_percent(q.get('ret_3m'))}  |  {text_value(q.get('source'))}",'HKDetail'))
-            ma20=nonempty_number(q.get('ma20'));ma60=nonempty_number(q.get('ma60'))
-            high=nonempty_number(q.get('high52'))
-            stats=[]
-            if ma20 is not None and ma60 is not None:
-                stats.append(f'20일선 {fmt(ma20,2)} / 60일선 {fmt(ma60,2)}')
-                stats.append('단기선 > 중기선' if ma20>ma60 else '단기선 ≤ 중기선')
-            if high and high>0:stats.append(f'52주 종가고점 대비 {(market_price/high-1)*100:+.1f}%')
-            if stats:parts.append(par('[기술 지표] '+'  ·  '.join(stats),'HKDetail'))
-        else:
-            # There may still be a previous app valuation price, but that is not market research.
-            parts.append(par('[시장 추세] 별도 종가·이동평균 데이터 미수집 (엑셀 입력가로 추세를 추정하지 않음)','HKDetail'))
-
-        fin=[]
-        pe=nonempty_number(info.get('trailingPE'))
-        roe=nonempty_number(info.get('returnOnEquity'))
-        rev=nonempty_number(info.get('revenueGrowth'))
+    def fundamental_lines(res,is_etf):
+        if is_etf:return ['ETF: 일반 기업 PER·ROE 대신 기초지수 및 구성종목 확인이 필요합니다.']
+        info=res.get('info') or {}; fin=[]
+        pe=number(info.get('trailingPE'));roe=number(info.get('returnOnEquity')); growth=number(info.get('revenueGrowth'))
         if pe is not None:fin.append(f'PER {pe:,.1f}배')
         if roe is not None:fin.append(f'ROE {roe*100:,.1f}%')
-        if rev is not None:fin.append(f'매출성장률 {rev*100:+.1f}%')
-        if fin:parts.append(par('[기업 지표] '+'  ·  '.join(fin)+' (Yahoo 공개 집계, 기간·기준 추가 확인 필요)','HKDetail'))
-        else:parts.append(par('[기업 지표] '+('ETF는 기업 PER/ROE 비교대상에서 제외' if is_etf else '공개 실적 및 밸류에이션 자료 미수집'),'HKDetail'))
-
-        estimates=res.get('quarters',[]) or []
-        latest=estimates[0] if estimates else None
-        if latest:
-            qbits=[]
+        if growth is not None:fin.append(f'매출 성장률 {growth*100:+.1f}%')
+        result=[]
+        if fin:result.append(' · '.join(fin))
+        quarters=res.get('quarters') or []
+        if quarters:
+            q=quarters[0]
+            vals=[]
             for key in ('매출액','영업이익','당기순이익'):
-                v=nonempty_number(latest.get(key))
-                if v is not None:qbits.append(f'{key} {v/1e8:,.1f}억')
-            if qbits:
-                cc=text_value(res.get('financial_currency'))
-                parts.append(par(f"[분기 실적] {text_value(latest.get('기간'))} · {' / '.join(qbits)} ({cc} 기준)",'HKDetail'))
-        user_target=nonempty_number(r.get('목표가'))
-        mean=nonempty_number(targets.get('mean'))
-        if is_etf:
-            parts.append(par('[목표가] ETF는 개별 기업 애널리스트 목표가와 직접 비교하지 않습니다.','HKDetail'))
-        elif user_target and user_target>0:
-            parts.append(par(f"[목표가] 입력값 {fmt(user_target,2)} {r.get('통화','')} · {text_value(r.get('목표가출처'))} · {text_value(r.get('목표가기준일'))} (사용자 입력값, 검증 필요)",'HKDetail'))
-        elif mean is not None:
-            cc=text_value(res.get('price_currency'))
-            parts.append(par(f'[컨센서스] Yahoo 집계 목표가 평균 {fmt(mean,2)} {cc} (개별 기관·발표일 미확인, 검증 전 참고)','HKDetail'))
-        else:parts.append(par('[목표가] 근거·발표일이 확인된 목표주가 없음','HKDetail'))
+                amt=number(q.get(key))
+                if amt is not None: vals.append(f'{key} {amt/1e8:,.1f}억')
+            if vals:result.append(f"최근 분기 {txt(q.get('기간'))} · {' / '.join(vals)} ({txt(res.get('financial_currency'))})")
+        return result or ['재무·분기 실적 미수집 (수집 버튼 실행 또는 공급원 확인 필요)']
 
-        articles=news_map.get(symbol,[]) or []
+    def target_line(r,res,is_etf):
+        if is_etf:return 'ETF: 단일 기업 목표주가 비교 제외'
+        target=number(r.get('목표가'))
+        if target and target>0:
+            return f"사용자 입력 목표가 {fmt(target,2)} {txt(r.get('통화'),'')} · {txt(r.get('목표가출처'),'출처 없음')} · {txt(r.get('목표가기준일'),'일자 없음')} (검증 필요)"
+        targets=res.get('analyst_targets') or {}
+        avg=number(targets.get('mean'))
+        if avg is not None:
+            return f"공개 집계 목표가 {fmt(avg,2)} {txt(res.get('price_currency'),'')} · 기관 및 발표일 미확인 (참고용)"
+        return '출처·발표일이 확인된 목표주가 없음'
+
+    def insights(r,q,res,is_etf):
+        notes=[]
+        wt=number(r.get('평가액비중(%)'));price=number(q.get('price'))
+        ma20=number(q.get('ma20'));ma60=number(q.get('ma60'))
+        hi=number(q.get('high52'))
+        g=number((res.get('info') or {}).get('revenueGrowth'))
+        if wt is not None and wt>=10:
+            notes.append(f'단일 포지션 비중 {wt:.1f}%: 업종 및 ETF 중복 노출 점검')
+        if price is not None and ma20 is not None and ma60 is not None:
+            notes.append('단기 20일선이 60일선 아래: 추세 변화 점검' if ma20 < ma60 else '20일선이 60일선 이상: 추세 유지 여부 점검')
+        if price is not None and hi and hi>0 and price/hi-1<=-0.25:
+            notes.append('52주 종가 최고 대비 25% 이상 하락: 변동성 원인 확인')
+        if not is_etf and g is not None and g<0:
+            notes.append('매출 성장률 음수: 실적 둔화의 지속 여부 확인')
+        if is_etf:notes.append('ETF 구성종목 중복 및 기초지수 변화 확인')
+        if not notes:
+            notes.append('최근 기업 이벤트와 비중 변화를 정기 확인')
+        return notes[:2]
+
+    def card(serial,r):
+        symbol=txt(r.get('티커'),'')
+        res=research_map.get(symbol) or {}
+        if not isinstance(res,dict):res={}
+        q=current_quote(res,quote_map.get(symbol) or {})
+        info=res.get('info') or {}
+        articles=news_map.get(symbol) or []
+        is_etf='ETF' in str(r.get('종목유형','')).upper()
+        label=txt(r.get('종목명'),txt(r.get('종목코드'),'종목'))
+        code=txt(r.get('종목코드'),'')
+        header=Table([[p(f'{serial:02d}    {label}  ({code})','cardtitle'),p(txt(r.get('고객구분')),'smallgreen')]],
+                     colWidths=[W-34*mm,34*mm])
+        header.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+            ('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),0),
+            ('TOPPADDING',(0,0),(-1,-1),0),('BOTTOMPADDING',(0,0),(-1,-1),1)]))
+        metrics=[('평가금액',won(r.get('평가액(원)'))),
+                 ('보유 비중',fmt(r.get('평가액비중(%)'),1,'%')),
+                 ('보유 수익률',pct(r.get('수익률(%)')))]
+        metrics_cells=[Table([[p(name,'label')],[p(val,'normal')]],colWidths=[(W-16*mm)/3 - 5],
+                       style=TableStyle([('BACKGROUND',(0,0),(-1,-1),PALE),
+                       ('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),0),
+                       ('TOPPADDING',(0,0),(-1,-1),0),('BOTTOMPADDING',(0,0),(-1,-1),0)]))
+                       for name,val in metrics]
+        metrics_table=Table([metrics_cells],colWidths=[(W-16*mm)/3]*3)
+        metrics_table.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),PALE),
+            ('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5),
+            ('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),0),
+            ('INNERGRID',(0,0),(-1,-1),1,colors.white)]))
+        content=[]
+        content.append(header)
+        content.append(Spacer(1,2*mm));content.append(metrics_table)
+        content.append(Spacer(1,3.5*mm))
+        def labeled(title,lines):
+            title_p=p(title,'smallgreen')
+            parts=[title_p]
+            for textline in lines[:2]:
+                parts.append(p(textline,'small',limit=125))
+            row=Table([[parts[0],parts[1:]]],colWidths=[25*mm,W-25*mm-16*mm],hAlign='LEFT')
+            row.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),
+                ('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),3),
+                ('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),2)]))
+            content.append(row)
+        labeled('시장 · 추세',market_lines(q))
+        labeled('실적 · 지표',fundamental_lines(res,is_etf))
+        labeled('목표주가',[target_line(r,res,is_etf)])
+        # News: title + original link in the PDF, with safe verified HTTPS only.
         if articles:
-            entry=articles[0]
-            headline=text_value(entry.get('제목'))
-            if len(headline)>100:headline=headline[:98]+'…'
-            parts.append(par(f"[최근 뉴스] {headline}  |  {text_value(entry.get('언론사'))}  |  {text_value(entry.get('발행일'))}",'HKDetail'))
-            url=str(entry.get('원문',''))
-            if url and urlsplit(url).scheme=='https' and urlsplit(url).netloc:
-                link=escape(url,{'\"':'&quot;'})
-                parts.append(Paragraph(f'[뉴스 원문] <link href=\"{link}\" color=\"#087D57\">기사 원문 바로가기</link>',sty['HKSmall']))
-        else:parts.append(par('[최근 뉴스] 해당 종목 뉴스 미조회 또는 검색 결과 없음','HKDetail'))
-        # Risk note is conditional and evidence based, not a blanket buy/sell signal.
-        flags=[]
-        wt=nonempty_number(r.get('평가액비중(%)'))
-        if wt is not None and wt>=10:flags.append(f'보유 집중도 {wt:.1f}%')
-        if market_price is not None and q.get('high52') is not None:
-            h=nonempty_number(q.get('high52'))
-            if h and (market_price/h-1)*100<-25:flags.append('52주 고점대비 -25% 초과 하락')
-        if market_price is not None:
-            fast=nonempty_number(q.get('ma20'));slow=nonempty_number(q.get('ma60'))
-            if fast is not None and slow is not None and fast<slow:
-                flags.append('20일선이 60일선을 하회')
-        if flags:parts.append(par('[추가 점검] '+' · '.join(flags),'HKDetail'))
-        elif market_price is not None and info:
-            parts.append(par('[관리 포인트] 실적 전망 변경과 가격 추세가 동시에 유지되는지 정기 확인','HKDetail'))
-        parts.append(Spacer(1,3*mm))
-        flow.append(KeepTogether(parts))
-    flow.append(par('자료 이용 안내','HKHead'))
-    flow.append(par('시세/뉴스 조회에는 공개 티커·회사명만 요청합니다. 다만 온라인 Streamlit Cloud에 업로드한 자료는 해당 서버에서 처리되므로, 실고객의 보유내역 사용 전 보안·전산·준법 승인 및 데이터 라이선스 검토가 필요합니다.','HKSmall'))
-    flow.append(par('이 문서는 사실확인 및 준법 검토 전 고객 제공용 공식 리서치·투자자문 자료가 아닙니다. 제공처 집계 목표가와 사용자 입력 목표가의 시점 및 정확성은 별도 확인해야 하며 미래 수익을 보증하지 않습니다.','HKSmall'))
-    def page(c,d):
-        c.saveState();c.setFont(font,7);c.setFillColor(grey)
-        c.drawString(17*mm,11*mm,'HanaV Private Portfolio  |  Internal working draft')
-        c.drawRightString(195*mm,11*mm,str(d.page));c.restoreState()
+            a=articles[0]
+            headline=txt(a.get('제목'),'제목 없음')[:74]
+            article_date=txt(a.get('발행일'),'일자 미확인')
+            article_source=txt(a.get('언론사'),'언론사 미확인')
+            news_s=f'{headline} · {article_source} / {article_date}'
+            labeled('주요 뉴스',[news_s])
+            url=a.get('원문','')
+            if valid_url(url):
+                # Only a validated HTTPS link is embedded. Text escapes separately.
+                safe_href=escape(str(url).strip(), {'"':'&quot;'})
+                content.append(Paragraph('　　<a href="'+safe_href+'" color="#14664C">기사 원문 열기 ↗</a>',st['micro']))
+        else:
+            labeled('주요 뉴스',['최근 뉴스 미수집 또는 결과 없음'])
+        labeled('관리 포인트',insights(r,q,res,is_etf))
+        # Provenance: user-supplied valuation vs market quote must remain distinct.
+        val_src=txt(r.get('가격출처'),'출처 없음')
+        quote_src=txt(q.get('source'),'미수집') if number(q.get('price')) is not None else '미수집'
+        meta=f'평가가격: {val_src} / 공개 가격추세: {quote_src} · 수집시점: {txt(q.get("date")) if number(q.get("price")) is not None else "—"}'
+        content.append(Spacer(1,1.5*mm))
+        content.append(p(meta,'micro',limit=130))
+        shell=Table([[content]],colWidths=[W],hAlign='LEFT')
+        shell.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),colors.white),
+            ('BOX',(0,0),(-1,-1),0.7,LINE),
+            ('LINEBEFORE',(0,0),(0,-1),2.5,BASE),
+            ('TOPPADDING',(0,0),(-1,-1),13),('BOTTOMPADDING',(0,0),(-1,-1),13),
+            ('LEFTPADDING',(0,0),(-1,-1),9),('RIGHTPADDING',(0,0),(-1,-1),9)]))
+        return shell
+
+    flow.append(p('전 종목 심층 점검 카드','main'))
+    flow.append(p('상세 정보는 수집 성공 항목만 반영합니다. 미수집은 전망 부재를 의미하지 않습니다.','micro'))
+    flow.append(Spacer(1,5*mm))
+    for idx,(_,r) in enumerate(sorted_df.iterrows(),1):
+        # 2 per page as a reading-first format, rather than eight dense paragraphs.
+        if idx>1 and idx%2==1:
+            flow.append(PageBreak())
+            flow.append(p('종목별 심층 점검','section'))
+            flow.append(Spacer(1,4*mm))
+        flow.append(KeepTogether([card(idx,r)]))
+        if idx%2==1 and idx<len(sorted_df):flow.append(Spacer(1,8*mm))
+
+    flow.append(Spacer(1,5*mm))
+    title('데이터 이용 및 준법 안내')
+    flow.append(p('이 문서는 내부 검토를 위한 분석 초안입니다. 외부 공개 시세·뉴스 데이터의 라이선스와 재배포 권한, 고객정보 처리 및 전산 보안, 투자자문·리서치 제공 절차에 대한 회사 승인이 필요합니다. 계좌정보 및 고객의 투자내역을 승인되지 않은 공개 클라우드에 업로드하지 마세요.','body'))
+    flow.append(Spacer(1,2*mm))
+    flow.append(p('목표주가는 입력값 또는 데이터 제공사의 집계값으로 개별 리서치 보고서의 투자 의견을 대체하지 않습니다. 실제 거래 및 상담 전에 원천 출처·기준일·환율을 확인해야 합니다.','body'))
+
+    def page(canvas,doc_ref):
+        canvas.saveState()
+        canvas.setStrokeColor(LINE)
+        canvas.setLineWidth(.55)
+        canvas.line(17*mm,15*mm, A4[0]-17*mm, 15*mm)
+        canvas.setFont(font,7)
+        canvas.setFillColor(MUTED)
+        canvas.drawString(17*mm,10.8*mm,'HanaV Private Portfolio  |  내부 검토용')
+        if demo:
+            canvas.drawCentredString(A4[0]/2,10.8*mm,'가상 시연 자료')
+        canvas.drawRightString(A4[0]-17*mm,10.8*mm,f'{doc_ref.page}')
+        canvas.restoreState()
     doc.build(flow,onFirstPage=page,onLaterPages=page)
     return buff.getvalue()
