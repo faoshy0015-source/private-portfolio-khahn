@@ -16,20 +16,177 @@ from services import fetch_history_batch,fetch_fx_krw_per_usd,fetch_google_news,
 
 st.set_page_config(page_title='HanaV Private Portfolio',page_icon='💠',layout='wide',initial_sidebar_state='expanded')
 st.markdown('''<style>
-:root{--hana:#00b779;--hana-soft:#daf5ea;--dark:#101b19;--line:#29463b}
-[data-testid="stAppViewContainer"]{background:linear-gradient(115deg,#081711 0%,#0E1F1A 45%,#111D1C 100%);color:#E5F5ED}
-[data-testid="stSidebar"]{background:#0b1d16}
-.block-container{max-width:1480px;padding-top:1.2rem}
-h1,h2,h3{letter-spacing:-.04rem}h1{color:#F4FFFA}
-.kicker{font-size:12px;letter-spacing:.16em;color:#5AD1A0;font-weight:800}
-.hero{background:linear-gradient(110deg,#0C3324,#122B26 63%,#10211D);border:1px solid #2D634B;border-left:5px solid #0DC489;border-radius:16px;padding:19px 22px;margin:0 0 19px}
-.hero h1{font-size:2.1rem;margin:.15rem 0 .4rem;line-height:1.18}
-.hero p{color:#A6BFB3;margin:0;font-size:14px}
-.info{background:#102A20;border:1px solid #2A5C49;border-radius:12px;padding:14px 17px}
-.stButton>button[kind="primary"]{background:#06986D!important;border:1px solid #45DFAD!important;color:#fff!important}
-small{color:#AAC7B7} [data-testid="stMetric"]{background:#112D23;border:1px solid #245540;padding:13px;border-radius:13px}
-[data-testid="stMetricLabel"]{color:#A4C4B4}[data-testid="stMetricValue"]{color:#E9FFF3}
-.stTabs [data-baseweb="tab"]{font-weight:650} .stAlert{border-radius:10px}
+/* HanaV Private Portfolio V1.0.3 — refined premium jade theme.
+   This visual layer intentionally works even if GitHub retains the old dark
+   .streamlit/config.toml. No changes to financial calculations or uploads. */
+:root {
+  --hanav-bg:#1C4036;
+  --hanav-bg-deep:#18372E;
+  --hanav-panel:#285447;
+  --hanav-panel-hover:#306452;
+  --hanav-sidebar:#17382F;
+  --hanav-border:#447969;
+  --hanav-line:#355E50;
+  --hanav-green:#66E5B4;
+  --hanav-white:#F6FFF9;
+  --hanav-text:#EBFAF1;
+  --hanav-muted:#C6DFD3;
+}
+html,body,.stApp,div[data-testid="stApp"],div[data-testid="stMain"],
+[data-testid="stAppViewContainer"],section[data-testid="stMain"] {
+  background:var(--hanav-bg) !important;
+  color:var(--hanav-text) !important;
+}
+[data-testid="stAppViewContainer"] {
+  background:linear-gradient(135deg,#1C4036 0%,#234B3D 54%,#1D4038 100%) !important;
+}
+/* Cloud header: eliminate the white stripe without hiding essential controls. */
+header[data-testid="stHeader"], [data-testid="stHeader"],
+.stAppHeader, [data-testid="stToolbar"], .stAppToolbar {
+  background:#1C4036 !important;
+  color:var(--hanav-white) !important;
+  box-shadow:none !important;
+  border-color:transparent !important;
+}
+[data-testid="stHeader"] button,[data-testid="stToolbar"] button,
+.stAppHeader button,.stAppToolbar button {
+  background:transparent !important;
+  color:var(--hanav-white) !important;
+}
+[data-testid="stHeader"] svg,[data-testid="stToolbar"] svg,
+.stAppHeader svg,.stAppToolbar svg {color:var(--hanav-white) !important;fill:currentColor;}
+[data-testid="stDecoration"] {background:#1C4036 !important;box-shadow:none !important;}
+/* Use a little more breathing room without sacrificing chart space. */
+.block-container {max-width:1480px;padding-top:1.5rem;padding-bottom:2.4rem;}
+h1,h2,h3,h4,h5,h6 {color:var(--hanav-white) !important;letter-spacing:-.025em;}
+p,li,label,[data-testid="stMarkdownContainer"],
+[data-testid="stWidgetLabel"],div[data-testid="stText"] {color:var(--hanav-text);}
+.stCaption,[data-testid="stCaptionContainer"],small,
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {color:var(--hanav-muted) !important;}
+a {color:#92F2CF;} a:hover{color:#B7FFE2;}
+/* Main banner: slightly lighter, refined and readable. */
+.kicker {font-size:12px;letter-spacing:.16em;color:#8AF5C6;font-weight:800;}
+.hero {
+  background:linear-gradient(110deg,#28624D 0%,#285A4B 58%,#224A3E 100%);
+  border:1px solid #579780;
+  border-left:5px solid #76EEC0;
+  border-radius:16px;
+  padding:22px 25px;
+  margin:0 0 19px;
+  box-shadow:0 10px 25px rgba(7,27,20,.10);
+}
+.hero h1 {font-size:2.07rem;color:#FFFFFF !important;margin:.2rem 0 .43rem;line-height:1.2;}
+.hero p {color:#D8F3E5 !important;margin:0;font-size:14px;}
+.info {background:#2B5B4B;border:1px solid #538A77;border-radius:12px;padding:14px 17px;}
+/* Sidebar: differentiated from canvas, but no near-black text. */
+section[data-testid="stSidebar"], [data-testid="stSidebar"],
+[data-testid="stSidebar"] > div, [data-testid="stSidebarContent"] {
+  background:var(--hanav-sidebar) !important;
+  color:var(--hanav-text) !important;
+}
+[data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,
+[data-testid="stSidebar"] h3,[data-testid="stSidebar"] h4,
+[data-testid="stSidebar"] p,[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] {
+  color:var(--hanav-white) !important;
+}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {color:#C4E4D4 !important;}
+[data-testid="stSidebar"] hr {border-color:#48705E !important;}
+/* Metric tiles. */
+[data-testid="stMetric"] {
+  background:linear-gradient(160deg,#2A604D 0%,#285245 100%) !important;
+  border:1px solid #4D9277 !important;
+  padding:15px 16px !important;
+  border-radius:14px !important;
+  box-shadow:0 5px 18px rgba(6,22,16,.10);
+}
+[data-testid="stMetricLabel"], [data-testid="stMetricLabel"] * {color:#D6F1E1 !important;}
+[data-testid="stMetricValue"], [data-testid="stMetricValue"] * {color:#FFFFFF !important;}
+[data-testid="stMetricDelta"], [data-testid="stMetricDelta"] * {font-weight:600;}
+/* Tabs: make both active and inactive menu labels legible. */
+.stTabs [data-baseweb="tab-list"] {gap:12px;border-bottom:1px solid #507D6B !important;}
+.stTabs [data-baseweb="tab"],.stTabs button[role="tab"] {
+  color:#C5E5D5 !important;
+  background:transparent !important;
+  border-radius:8px 8px 0 0;
+  font-weight:650 !important;
+  padding:10px 11px !important;
+}
+.stTabs [data-baseweb="tab"] *,.stTabs button[role="tab"] * {color:inherit !important;}
+.stTabs [data-baseweb="tab"]:hover,.stTabs button[role="tab"]:hover {
+  color:#FFFFFF !important;background:rgba(117,225,179,.10) !important;
+}
+.stTabs [data-baseweb="tab"][aria-selected="true"],
+.stTabs button[role="tab"][aria-selected="true"] {
+  color:#FFFFFF !important;background:rgba(103,230,181,.14) !important;
+}
+.stTabs [data-baseweb="tab-highlight"] {background:#6CE7B7 !important;height:3px !important;}
+.stTabs [data-baseweb="tab-border"] {background:#3C6D58 !important;}
+/* Inputs, selects and file upload: remove glaring white boxes. */
+[data-baseweb="select"] > div,
+[data-baseweb="input"], [data-baseweb="base-input"],
+[data-baseweb="textarea"], [data-testid="stNumberInput"] input,
+[data-testid="stTextInput"] input {
+  background:#2B5949 !important;
+  border-color:#5F9A7F !important;
+  color:#FFFFFF !important;
+  border-radius:9px !important;
+}
+[data-baseweb="select"] *, [data-baseweb="input"] input,
+[data-baseweb="base-input"] input,[data-baseweb="textarea"] textarea {
+  color:#FFFFFF !important;
+}
+[data-baseweb="select"] svg {color:#EAFDF0 !important;}
+[data-baseweb="popover"] [role="listbox"],
+[data-baseweb="popover"] [role="option"],
+[data-baseweb="menu"] {background:#244B3E !important;color:#FFFFFF !important;}
+[data-baseweb="popover"] [role="option"]:hover {background:#336D55 !important;}
+[data-testid="stFileUploaderDropzone"] {
+  background:#294F41 !important;
+  border:1px dashed #7CC5A6 !important;
+  border-radius:12px !important;
+}
+[data-testid="stFileUploaderDropzone"] *,
+[data-testid="stFileUploaderDropzoneInstructions"] * {color:#F1FFF8 !important;}
+/* Buttons. White default buttons previously clashed with the dark dashboard. */
+.stButton > button, .stDownloadButton > button,
+[data-testid^="stBaseButton-"] {
+  background:#315E4E !important;
+  color:#FFFFFF !important;
+  border:1px solid #70AD90 !important;
+  border-radius:9px !important;
+  font-weight:600 !important;
+  box-shadow:none !important;
+}
+.stButton > button:hover,.stDownloadButton > button:hover,
+[data-testid^="stBaseButton-"]:hover {
+  background:#3A755C !important;
+  border-color:#97EFC7 !important;
+  color:#FFFFFF !important;
+}
+.stButton > button[kind="primary"],button[data-testid="stBaseButton-primary"] {
+  background:#058C65 !important;border-color:#70E8B5 !important;color:#FFFFFF !important;
+}
+.stButton > button[kind="primary"]:hover,button[data-testid="stBaseButton-primary"]:hover {
+  background:#0AA778 !important;border-color:#A2F3D0 !important;
+}
+button:focus-visible,input:focus-visible,[role="tab"]:focus-visible {
+  outline:2px solid #9AF6CF !important;outline-offset:2px;
+}
+/* Native radios and alert panels. */
+[data-testid="stRadio"] label,[data-testid="stRadio"] label p {color:#F0FFF6 !important;}
+[data-testid="stAlert"] {border-radius:12px !important;}
+[data-testid="stAlert"] [data-testid="stMarkdownContainer"] {color:inherit;}
+[data-testid="stExpander"] {border-color:#4D816C !important;border-radius:10px !important;}
+hr {border-color:#487662 !important;}
+/* Responsive readability */
+@media(max-width:700px) {
+  .block-container {padding-left:1rem;padding-right:1rem;padding-top:1rem;}
+  .hero {padding:17px 18px;}
+  .hero h1 {font-size:1.68rem;}
+  .stTabs [data-baseweb="tab"] {padding:9px 8px !important;}
+}
 </style>''',unsafe_allow_html=True)
 
 # ------- Authentication: required even for local pilot. No embedded default password. -------
@@ -133,7 +290,7 @@ st.session_state.setdefault('fx_source','가상 환율' if st.session_state['is_
 
 with st.sidebar:
     st.markdown('## 💠 HanaV Private')
-    st.caption('Portfolio Intelligence | V1.0.2')
+    st.caption('Portfolio Intelligence | V1.0.3')
     if st.button('로그아웃',use_container_width=True):
         # Completely clear current browser session's customer-position data.
         st.session_state.clear()
@@ -261,7 +418,7 @@ with tab_dashboard:
         if not chart_df.empty:
             chart_df['표기']=chart_df.apply(lambda r:(r['종목명'] or r['종목코드'])[:20],axis=1)
             fig=px.bar(chart_df.sort_values('평가액(원)'),x='평가액(원)',y='표기',orientation='h',color_discrete_sequence=['#13B985'],height=425)
-            fig.update_layout(paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)',font_color='#DDF6EA',margin=dict(l=0,r=8,t=5,b=5),yaxis_title='',xaxis_title='KRW')
+            fig.update_layout(paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)',font_color='#F1FFF7',margin=dict(l=0,r=8,t=5,b=5),yaxis_title='',xaxis_title='KRW')
             st.plotly_chart(fig,use_container_width=True)
         else:st.info('평가액을 표시할 수 있는 기준가가 없습니다.')
     with g2:
@@ -271,7 +428,7 @@ with tab_dashboard:
         if not sector_df.empty:
             sums=sector_df.groupby('업종')['평가액(원)'].sum().reset_index()
             fig=px.pie(sums,names='업종',values='평가액(원)',hole=.58,color_discrete_sequence=['#0EB780','#54D7B8','#337B6E','#C2A777','#7EC4D5','#397F67','#ADDDC7'])
-            fig.update_layout(paper_bgcolor='rgba(0,0,0,0)',font_color='#DDF6EA',height=425,margin=dict(t=8,l=8,b=8,r=8))
+            fig.update_layout(paper_bgcolor='rgba(0,0,0,0)',font_color='#F1FFF7',height=425,margin=dict(t=8,l=8,b=8,r=8))
             st.plotly_chart(fig,use_container_width=True)
         else:st.info('업종분포 계산에 필요한 평가액이 없습니다.')
     st.subheader('VVIP 모니터링 포인트')
@@ -323,7 +480,7 @@ with tab_research:
             fig.add_trace(go.Scatter(x=hist.index,y=hist.values,mode='lines',name='종가',line=dict(color='#13C58C',width=2)))
             for days,name,color in [(20,'MA20','#EDC878'),(60,'MA60','#85B5FB'),(120,'MA120','#B79AEF')]:
                 if len(hist)>=days:fig.add_trace(go.Scatter(x=hist.index,y=hist.rolling(days).mean(),name=name,line=dict(color=color,width=1.2)))
-            fig.update_layout(height=420,paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)',font_color='#DDF6EA',margin=dict(l=0,r=0,t=0,b=0))
+            fig.update_layout(height=420,paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)',font_color='#F1FFF7',margin=dict(l=0,r=0,t=0,b=0))
             st.plotly_chart(fig,use_container_width=True)
         else:st.info('시세 갱신을 누르면 공개 데이터가 제공되는 종목은 이동평균 차트를 확인할 수 있습니다.')
     with d2:
@@ -394,4 +551,4 @@ with tab_report:
     st.markdown('• 데이터 제공사의 라이선스 및 대외 재배포 가능 여부  \n• 고객정보 처리 및 전산 보안 승인 여부  \n• 목표가·증권사 의견 인용의 적법성 및 근거 출처  \n• 고객 제공자료의 준법 검토 및 버전 이력 관리')
 
 st.divider()
-st.caption('HanaV Private Portfolio V1.0.2 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
+st.caption('HanaV Private Portfolio V1.0.3 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
