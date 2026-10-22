@@ -16,7 +16,7 @@ from services import fetch_history_batch,fetch_fx_krw_per_usd,fetch_google_news,
 
 st.set_page_config(page_title='HanaV Private Portfolio',page_icon='💠',layout='wide',initial_sidebar_state='expanded')
 st.markdown('''<style>
-/* HanaV Private Portfolio V1.0.10 — refined premium jade theme.
+/* HanaV Private Portfolio V1.0.11 — dashboard chart readability repair.
    This visual layer intentionally works even if GitHub retains the old dark
    .streamlit/config.toml. No changes to financial calculations or uploads. */
 :root {
@@ -621,7 +621,7 @@ st.session_state.setdefault('fx_source','가상 환율' if st.session_state['is_
 
 with st.sidebar:
     st.markdown('## 💠 HanaV Private')
-    st.caption('Portfolio Intelligence | V1.0.10')
+    st.caption('Portfolio Intelligence | V1.0.11')
     if st.button('로그아웃',use_container_width=True):
         # Completely clear current browser session's customer-position data.
         st.session_state.clear()
@@ -744,6 +744,103 @@ if price_mode=='Yahoo 공개 종가 조회' and st.session_state.get('quotes'):
 
 tab_dashboard,tab_holdings,tab_research,tab_news,tab_report=st.tabs(['📊 대시보드','📋 보유종목 관리','🔎 종목별 심층분석','📰 뉴스 모니터링','📑 보고서'])
 
+# ---- Dashboard charts: readable even with many holdings and a narrow sidebar. ----
+def build_top_holdings_chart(positions: pd.DataFrame):
+    """15 positions, distinct labels, explicit left margin, and readable KRW 100M units."""
+    data = positions.dropna(subset=['평가액(원)']).copy()
+    data = data[data['평가액(원)'] > 0].nlargest(15, '평가액(원)').reset_index(drop=True)
+    if data.empty:
+        return None
+
+    # Multiple family members can own the same security; show which account.
+    duplicate = data['종목명'].fillna('').astype(str).duplicated(keep=False)
+    labels = []
+    for i, r in data.iterrows():
+        name = str(r.get('종목명') or r.get('종목코드') or '미확인')
+        name = name[:12] + ('…' if len(name) > 12 else '')
+        if duplicate.iloc[i]:
+            label = f"{str(r.get('고객구분',''))[:4]} · {name}"
+        else:
+            label = name
+        labels.append(label)
+
+    amounts = (data['평가액(원)'].astype(float) / 1e8).tolist()
+    texts = [f'{v:,.2f}억' for v in amounts]
+    positions_y = list(range(len(data)))
+    fig = go.Figure(go.Bar(
+        x=amounts, y=positions_y, orientation='h',
+        marker=dict(color='#24B993', line=dict(color='#56DBB1', width=.4)),
+        text=texts, textposition='outside', cliponaxis=False,
+        textfont=dict(size=11, color='#F7FFF9'),
+        customdata=[[str(r.get('고객구분','')), str(r.get('종목코드',''))] for _,r in data.iterrows()],
+        hovertemplate='%{customdata[0]} · %{customdata[1]}<br>평가액: %{x:,.2f}억 원<extra></extra>',
+    ))
+    fig.update_layout(
+        height=510, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(family='Arial, Malgun Gothic, sans-serif', color='#F4FFF8', size=12),
+        margin=dict(l=135, r=64, t=12, b=48), showlegend=False,
+        bargap=.30,
+    )
+    fig.update_yaxes(
+        tickmode='array', tickvals=positions_y, ticktext=labels,
+        tickfont=dict(color='#F4FFF8',size=11), showticklabels=True,
+        showgrid=False, showline=False, zeroline=False,
+        autorange='reversed', fixedrange=True,
+    )
+    fig.update_xaxes(
+        title='평가액 (억원)', title_font=dict(color='#DCF6E9',size=11),
+        tickfont=dict(color='#DCF6E9',size=11),
+        gridcolor='rgba(209,245,224,0.14)', showgrid=True,
+        zeroline=False, showline=False, fixedrange=True,
+        range=[0, max(amounts)*1.31],
+    )
+    return fig
+
+
+def build_sector_chart(positions: pd.DataFrame):
+    """Aggregate less significant sectors to avoid a 20-item unreadable legend."""
+    data = positions.dropna(subset=['평가액(원)']).copy()
+    data = data[data['평가액(원)'] > 0]
+    if data.empty:
+        return None, 0
+    data['업종'] = data['업종'].fillna('').astype(str).str.strip().replace('', '미분류')
+    sectors = data.groupby('업종', dropna=False)['평가액(원)'].sum().sort_values(ascending=False)
+    total = float(sectors.sum())
+    if total <= 0: return None, 0
+    n_original = len(sectors)
+    if n_original > 9:
+        top = sectors.iloc[:8].copy()
+        top.loc['기타 업종'] = float(sectors.iloc[8:].sum())
+        sectors = top
+    names = [s[:8]+'…' if len(s)>8 else s for s in sectors.index.astype(str)]
+    shares = (sectors / total * 100.0).tolist()
+    fig = go.Figure(go.Bar(
+        x=shares, y=list(range(len(shares))), orientation='h',
+        marker=dict(color=['#25BC93' if i==0 else '#5BC8B3' if i%2 else '#3BAA97' for i in range(len(shares))],
+                    line=dict(color='#91E8CE', width=.35)),
+        text=[f'{x:.1f}%' for x in shares], textposition='outside', cliponaxis=False,
+        textfont=dict(color='#F7FFF9',size=11),
+        customdata=(sectors/1e8).tolist(),
+        hovertemplate='자산 비중 %{x:.2f}%<br>평가액 %{customdata:,.2f}억 원<extra></extra>',
+    ))
+    fig.update_layout(
+        height=510, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(family='Arial, Malgun Gothic, sans-serif',color='#F4FFF8',size=12),
+        margin=dict(l=92,r=60,t=12,b=48),showlegend=False,bargap=.33,
+    )
+    fig.update_yaxes(
+        tickmode='array',tickvals=list(range(len(shares))),ticktext=names,
+        tickfont=dict(color='#F4FFF8',size=11),showticklabels=True,
+        showgrid=False,showline=False,zeroline=False,autorange='reversed',fixedrange=True,
+    )
+    fig.update_xaxes(
+        title='평가액 비중 (%)',title_font=dict(color='#DCF6E9',size=11),
+        tickfont=dict(color='#DCF6E9',size=11),gridcolor='rgba(209,245,224,0.14)',
+        showgrid=True,zeroline=False,showline=False,fixedrange=True,
+        range=[0,max(shares)*1.38],
+    )
+    return fig,n_original
+
 with tab_dashboard:
     c1,c2,c3,c4=st.columns(4)
     c1.metric('보유 포지션',f"{summary['positions']:,}개")
@@ -754,31 +851,24 @@ with tab_dashboard:
     c3.metric('가격/환율 미반영',f"{summary['unconverted']}개")
     c4.metric('최대 보유비중',f"{summary['largest_weight']:.1f}%" if pd.notna(summary['largest_weight']) else '—')
     if not summary['complete_total']:st.error('**불완전한 평가금액**: 미조회 포지션이 있으므로 위 합계와 비중은 일부 자산 기준입니다.')
-    g1,g2=st.columns([1.25,1])
+    # Separate readable bars replace the clipped names and overfull pie legend.
+    g1,g2=st.columns([1.25,1], gap='large')
     with g1:
         st.subheader('평가액 상위 15개')
-        chart_df=positions.dropna(subset=['평가액(원)']).nlargest(15,'평가액(원)').copy()
-        if not chart_df.empty:
-            chart_df['표기']=chart_df.apply(lambda r:(r['종목명'] or r['종목코드'])[:20],axis=1)
-            fig=px.bar(chart_df.sort_values('평가액(원)'),x='평가액(원)',y='표기',orientation='h',color_discrete_sequence=['#13B985'],height=425)
-            fig.update_layout(paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)',font=dict(color='#F1FFF7',size=12),margin=dict(l=0,r=8,t=5,b=5),yaxis_title='',xaxis_title='KRW')
-            fig.update_xaxes(tickfont=dict(color='#DDF6E8'),title_font=dict(color='#DDF6E8'))
-            fig.update_yaxes(tickfont=dict(color='#EDF9F2'))
-            st.plotly_chart(fig,use_container_width=True,theme=None)
-        else:st.info('평가액을 표시할 수 있는 기준가가 없습니다.')
+        fig=build_top_holdings_chart(positions)
+        if fig is None:
+            st.info('평가액을 표시할 수 있는 기준가가 없습니다.')
+        else:
+            st.plotly_chart(fig,use_container_width=True,theme=None,config={'displayModeBar':False})
     with g2:
-        st.subheader('자산 분포')
-        sector_df=positions.dropna(subset=['평가액(원)']).copy()
-        sector_df['업종']=sector_df['업종'].replace('', '미분류')
-        if not sector_df.empty:
-            sums=sector_df.groupby('업종')['평가액(원)'].sum().reset_index()
-            fig=px.pie(sums,names='업종',values='평가액(원)',hole=.58,color_discrete_sequence=['#0EB780','#54D7B8','#337B6E','#C2A777','#7EC4D5','#397F67','#ADDDC7'])
-            fig.update_traces(textinfo='none',hovertemplate='%{label}: %{percent:.1%}<extra></extra>')
-            fig.update_layout(paper_bgcolor='rgba(0,0,0,0)',font=dict(color='#F4FFF9',size=12),
-                              legend=dict(font=dict(color='#F4FFF9',size=12),bgcolor='rgba(0,0,0,0)'),
-                              height=425,margin=dict(t=8,l=8,b=8,r=8))
-            st.plotly_chart(fig,use_container_width=True,theme=None)
-        else:st.info('업종분포 계산에 필요한 평가액이 없습니다.')
+        st.subheader('업종별 자산 비중')
+        fig,n_sectors=build_sector_chart(positions)
+        if fig is None:
+            st.info('업종분포 계산에 필요한 평가액이 없습니다.')
+        else:
+            st.plotly_chart(fig,use_container_width=True,theme=None,config={'displayModeBar':False})
+            if n_sectors>9:
+                st.caption(f'전체 {n_sectors}개 업종 중 상위 8개와 기타 업종 합계를 표시했습니다.')
     st.subheader('VVIP 모니터링 포인트')
     for msg in risk_findings(positions):st.markdown('• '+msg)
     st.caption('업종 분류는 입력된 데이터 기준이며 ETF 기초자산 중복은 V1에서 미계산합니다. 투자권고·매매신호가 아닙니다.')
@@ -1097,4 +1187,4 @@ with tab_report:
     st.markdown('• 데이터 제공사의 라이선스 및 대외 재배포 가능 여부  \n• 고객정보 처리 및 전산 보안 승인 여부  \n• 목표가·증권사 의견 인용의 적법성 및 근거 출처  \n• 고객 제공자료의 준법 검토 및 버전 이력 관리')
 
 st.divider()
-st.caption('HanaV Private Portfolio V1.0.10 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
+st.caption('HanaV Private Portfolio V1.0.11 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
