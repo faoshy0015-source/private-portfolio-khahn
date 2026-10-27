@@ -197,11 +197,154 @@ def current_to_manual_rows(portfolio: pd.DataFrame, cash: dict) -> pd.DataFrame:
     for col in ('보유수량', '평균단가', '현금'):
         out[col] = pd.to_numeric(out[col], errors='coerce')
     return out
+
+# ---- Editable Excel backup for six-column in-app portfolio draft (stdlib-only XLSX writer) ----
+def manual_rows_excel_bytes(rows: pd.DataFrame) -> bytes:
+    """Export even *unfinished* editor rows; do not require portfolio validation.
+
+    Important: emit codes/aliases/names as literal Excel strings, never formulas.
+    A downloaded file stays on the operator's PC (not on the Streamlit server).
+    """
+    from zipfile import ZipFile, ZIP_DEFLATED
+    from xml.sax.saxutils import escape as xml_escape
+
+    data = rows.reindex(columns=MANUAL_COLUMNS).copy()
+    # Empty editor placeholder rows are excluded; a partially entered row is kept.
+    data = data.loc[data.apply(lambda row: any(
+        not pd.isna(v) and str(v).strip() != '' for v in row
+    ), axis=1)]
+
+    def clean_xml(v: object) -> str:
+        # Excel XML 1.0 can't contain raw control characters.
+        v = str(v)
+        return ''.join(ch for ch in v if ord(ch) >= 32 or ch in ('\t', '\n', '\r'))
+
+    def letter(col_zero: int) -> str:
+        return 'ABCDEF'[col_zero]
+
+    def text_cell(address: str, value: object, style: int = 2) -> str:
+        escaped = xml_escape(clean_xml(value))
+        return (f'<c r="{address}" s="{style}" t="inlineStr">'
+                f'<is><t xml:space="preserve">{escaped}</t></is></c>')
+
+    rows_xml = ['<row r="1" ht="26" customHeight="1">' +
+                ''.join(text_cell(f'{letter(i)}1', name, 1)
+                        for i,name in enumerate(MANUAL_COLUMNS)) + '</row>']
+    for idx, (_, record) in enumerate(data.iterrows(), start=2):
+        cells = []
+        for j, column in enumerate(MANUAL_COLUMNS):
+            v = record[column]
+            if pd.isna(v) or str(v).strip() == '':
+                continue
+            ref = f'{letter(j)}{idx}'
+            if column in ('고객구분', '종목코드', '종목명'):
+                cells.append(text_cell(ref, v))
+            else:
+                try:
+                    num = float(v)
+                    if math.isfinite(num):
+                        cells.append(f'<c r="{ref}" s="3"><v>{num:.15g}</v></c>')
+                    else:
+                        cells.append(text_cell(ref, v))
+                except (ValueError, TypeError, OverflowError):
+                    # Unfinished drafts remain faithfully restorable, errors are
+                    # checked only when applying to the portfolio.
+                    cells.append(text_cell(ref, v))
+        rows_xml.append(f'<row r="{idx}">' + ''.join(cells) + '</row>')
+
+    last = max(1, len(rows_xml))
+    worksheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<sheetViews><sheetView workbookViewId="0">'
+        '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+        '</sheetView></sheetViews>'
+        '<sheetFormatPr defaultRowHeight="19"/>'
+        '<cols><col min="1" max="1" width="19" customWidth="1"/>'
+        '<col min="2" max="2" width="20" customWidth="1"/>'
+        '<col min="3" max="3" width="26" customWidth="1"/>'
+        '<col min="4" max="4" width="15" customWidth="1"/>'
+        '<col min="5" max="5" width="19" customWidth="1"/>'
+        '<col min="6" max="6" width="19" customWidth="1"/></cols>'
+        '<sheetData>' + ''.join(rows_xml) + '</sheetData>'
+        f'<autoFilter ref="A1:F{last}"/>'
+        '</worksheet>'
+    )
+    types = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+             '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+             '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+             '<Default Extension="xml" ContentType="application/xml"/>'
+             '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+             '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+             '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+             '</Types>')
+    rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            '</Relationships>')
+    workbook = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                '<sheets><sheet name="보유현황" sheetId="1" r:id="rId1"/></sheets></workbook>')
+    wb_rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+               '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+               '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+               '</Relationships>')
+    styles = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+              '<fonts count="2"><font><sz val="11"/><name val="맑은 고딕"/></font>'
+              '<font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="맑은 고딕"/></font></fonts>'
+              '<fills count="3"><fill><patternFill patternType="none"/></fill>'
+              '<fill><patternFill patternType="gray125"/></fill>'
+              '<fill><patternFill patternType="solid"><fgColor rgb="FF136D53"/><bgColor indexed="64"/></patternFill></fill></fills>'
+              '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+              '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+              '<cellXfs count="4">'
+              '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+              '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFill="1" applyFont="1"/>'
+              '<xf numFmtId="49" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+              '<xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+              '</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+              '</styleSheet>')
+    files = {
+        '[Content_Types].xml':types, '_rels/.rels':rels,
+        'xl/workbook.xml':workbook, 'xl/_rels/workbook.xml.rels':wb_rels,
+        'xl/worksheets/sheet1.xml':worksheet, 'xl/styles.xml':styles,
+    }
+    memory = BytesIO()
+    with ZipFile(memory, 'w', compression=ZIP_DEFLATED) as archive:
+        for name, content in files.items():
+            archive.writestr(name, content.encode('utf-8'))
+    return memory.getvalue()
+
+
+def manual_draft_from_excel(excel_bytes: bytes) -> pd.DataFrame:
+    """Read an exported draft *without* requiring finished/valid holdings."""
+    imported = pd.read_excel(BytesIO(excel_bytes), sheet_name=0, dtype={'종목코드': str})
+    imported.columns = [str(c).strip() for c in imported.columns]
+    missing = [col for col in MANUAL_COLUMNS if col not in imported.columns]
+    if missing:
+        raise ValueError('입력표 복구에 필요한 열이 없습니다: ' + ', '.join(missing))
+    result = imported[MANUAL_COLUMNS].copy()
+    # Excel sometimes interprets numeric codes as numbers; preserve 6-digit codes.
+    result['종목코드'] = result['종목코드'].map(
+        lambda value: (str(value).strip().zfill(6) if str(value).strip().isdigit()
+                       and len(str(value).strip()) <= 6 else str(value).strip())
+        if not pd.isna(value) else None
+    )
+    for name in ('보유수량', '평균단가', '현금'):
+        result[name] = pd.to_numeric(result[name], errors='coerce')
+    if result.empty:
+        return blank_manual_rows()
+    return result.reset_index(drop=True)
+# ---- End editable Excel backup helpers ----
+
 # ---- End built-in direct-entry and six-column import helpers ----
 
 st.set_page_config(page_title='HanaV Private Portfolio',page_icon='💠',layout='wide',initial_sidebar_state='expanded')
 st.markdown('''<style>
-/* HanaV Private Portfolio V1.0.13 — dashboard chart readability repair.
+/* HanaV Private Portfolio V1.0.15 — draft save and resume.
    This visual layer intentionally works even if GitHub retains the old dark
    .streamlit/config.toml. No changes to financial calculations or uploads. */
 :root {
@@ -813,6 +956,7 @@ st.session_state.setdefault('fx_val',1350.0)  # 가상 65종목 시연 전용; �
 st.session_state.setdefault('fx_source','가상 환율' if st.session_state['is_demo'] else '입력 없음')
 st.session_state.setdefault('manual_entry_rows', blank_manual_rows())
 st.session_state.setdefault('manual_editor_rev', 0)
+st.session_state.setdefault('draft_restore_rev', 0)
 
 def install_portfolio(normalized, cash_by_customer, warnings, is_simple, source_name):
     """Shared in-memory dataset loader for manual input and file uploads."""
@@ -853,7 +997,7 @@ if st.session_state.get('pending_manual_submission') is not None:
 
 with st.sidebar:
     st.markdown('## 💠 HanaV Private')
-    st.caption('Portfolio Intelligence | V1.0.13')
+    st.caption('Portfolio Intelligence | V1.0.15')
     if st.button('로그아웃',use_container_width=True):
         # Completely clear current browser session's customer-position data.
         st.session_state.clear()
@@ -861,7 +1005,7 @@ with st.sidebar:
     st.divider()
     st.markdown('#### 1. 보유현황 입력')
     st.success('✍ 엑셀 없이 입력: 오른쪽 화면의 **직접 입력** 탭을 이용하세요.')
-    st.caption('파일 업로드는 선택사항이며, 직접 입력만으로 분석할 수 있습니다.')
+    st.caption('입력 도중에도 ✍ 직접 입력 탭에서 엑셀로 저장하고 다음 접속 때 복구할 수 있습니다.')
     st.download_button('📥 보유종목 엑셀 양식 다운로드',data=portfolio_template_bytes(),file_name='HanaV_Private_Portfolio_간편양식.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
     st.caption('간편 양식 6개 항목만 입력: 고객구분 · 종목코드 · 종목명 · 보유수량 · 평균단가 · 현금. 기존 상세양식도 지원합니다.')
     uploaded=st.file_uploader('고객별 보유종목 파일',type=['xlsx','csv'],key=f"input_upload_{st.session_state['upload_rev']}",help='고객구분(별칭), 종목코드, 종목명, 보유수량, 평균단가, 현금만 입력해도 됩니다. 계좌번호와 실명은 제외하세요.')
@@ -880,7 +1024,7 @@ with st.sidebar:
                 st.session_state['manual_editor_rev']+=1
                 st.success(st.session_state['apply_flash'])
             except Exception as e:st.error(f'파일을 읽을 수 없습니다: {e}')
-    st.caption('파일은 현재 접속 세션에서만 보유하며 별도 DB에 자동 저장하지 않습니다.')
+    st.caption('저장한 엑셀은 업로드 가능하며, 입력 중인 미완성 표는 직접 입력 탭의 복구 기능을 이용하세요. 서버에 자동 저장하지 않습니다.')
     if st.button('가상 65종목 데모 다시 열기',use_container_width=True):
         st.session_state['portfolio_raw']=load_demo()
         st.session_state['cash_by_customer']={}
@@ -1026,20 +1170,34 @@ with tab_manual:
             st.session_state['manual_entry_rows']=blank_manual_rows()
             st.session_state['manual_editor_rev']+=1
             st.rerun()
-    with st.form('direct_input_form',clear_on_submit=False):
-        direct_rows=st.data_editor(
-            st.session_state['manual_entry_rows'],
-            num_rows='dynamic', hide_index=True, use_container_width=True, height=345,
-            column_order=MANUAL_COLUMNS,
-            column_config={
-                '고객구분':st.column_config.TextColumn('고객구분',help='실명이 아닌 고객 별칭을 입력하세요.'),
-                '종목코드':st.column_config.TextColumn('종목코드',help='앞자리 0 유지. 코스닥은 .KQ를 붙입니다.'),
-                '종목명':st.column_config.TextColumn('종목명'),
-                '보유수량':st.column_config.NumberColumn('보유수량',min_value=0.0,step=1.0),
-                '평균단가':st.column_config.NumberColumn('평균단가',min_value=0.0,step=1.0),
-                '현금':st.column_config.NumberColumn('현금(원)',min_value=0.0,step=100000.0),
-            }, key=f"direct_editor_{st.session_state['manual_editor_rev']}")
-        submitted=st.form_submit_button('✅ 입력 내용으로 포트폴리오 반영',type='primary',use_container_width=True)
+    # Intentionally NOT in st.form: st.data_editor updates on each edit/rerun,
+    # so Excel backup can include the *latest draft* without first applying it.
+    direct_rows=st.data_editor(
+        st.session_state['manual_entry_rows'],
+        num_rows='dynamic', hide_index=True, use_container_width=True, height=345,
+        column_order=MANUAL_COLUMNS,
+        column_config={
+            '고객구분':st.column_config.TextColumn('고객구분',help='실명이 아닌 고객 별칭을 입력하세요.'),
+            '종목코드':st.column_config.TextColumn('종목코드',help='앞자리 0 유지. 코스닥은 .KQ를 붙입니다.'),
+            '종목명':st.column_config.TextColumn('종목명'),
+            '보유수량':st.column_config.NumberColumn('보유수량',min_value=0.0,step=1.0),
+            '평균단가':st.column_config.NumberColumn('평균단가',min_value=0.0,step=1.0),
+            '현금':st.column_config.NumberColumn('현금(원)',min_value=0.0,step=100000.0),
+        }, key=f"direct_editor_{st.session_state['manual_editor_rev']}")
+    st.caption('💡 종목을 입력한 뒤 **엑셀로 저장**하면 분석 반영 전의 미완성 행까지 그대로 보관할 수 있습니다.')
+    valid_count=sum(any(not pd.isna(v) and str(v).strip()!='' for v in row)
+                    for row in direct_rows[MANUAL_COLUMNS].itertuples(index=False, name=None))
+    c_save,c_apply=st.columns([1, 1])
+    with c_save:
+        st.download_button(
+            '💾 현재 입력표 엑셀 저장',
+            data=manual_rows_excel_bytes(direct_rows),
+            file_name=f'HanaV_보유현황_입력저장_{datetime.now():%Y%m%d_%H%M}.xlsx',
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            disabled=valid_count==0, use_container_width=True,
+            help='브라우저의 다운로드 폴더에 저장합니다. 포트폴리오 반영 여부와 무관하게 저장됩니다.')
+    with c_apply:
+        submitted=st.button('✅ 입력 내용으로 포트폴리오 반영',type='primary',use_container_width=True)
     if submitted:
         try:
             parsed=parse_manual_rows(direct_rows)
@@ -1049,9 +1207,28 @@ with tab_manual:
             st.rerun()
         except Exception as e:
             st.error(f'직접 입력을 확인해 주세요: {e}')
+
+    with st.expander('📂 저장한 엑셀을 불러와 이어서 입력하기', expanded=False):
+        draft_uploaded=st.file_uploader('이전에 저장한 6열 엑셀 파일',
+            type=['xlsx'], key=f"draft_restore_{st.session_state['draft_restore_rev']}",
+            help='현재 입력표를 복구된 내용으로 교체합니다. 미완성 행도 불러옵니다.')
+        if draft_uploaded is not None:
+            st.warning('불러오기를 실행하면 현재 입력표가 교체됩니다. 기존 내용이 필요하면 먼저 엑셀로 저장하세요.')
+            if st.button('↩ 저장한 입력표 불러오기', use_container_width=True):
+                try:
+                    restored=manual_draft_from_excel(draft_uploaded.getvalue())
+                    st.session_state['manual_entry_rows']=restored
+                    st.session_state['manual_editor_rev']+=1
+                    st.session_state['draft_restore_rev']+=1
+                    st.session_state['draft_restore_flash']=f'엑셀에서 {len(restored)}개 행을 불러왔습니다. 이어서 수정하거나 포트폴리오에 반영하세요.'
+                    st.rerun()
+                except Exception as e:
+                    st.error(f'입력표 복구 오류: {e}')
+    if st.session_state.pop('draft_restore_flash', None):
+        st.success('저장한 엑셀 입력표를 복구했습니다. 이어서 수정할 수 있습니다.')
     if st.session_state.get('apply_flash') and st.session_state.get('portfolio_source')=='직접 입력':
         st.success(st.session_state['apply_flash'])
-    st.info('입력 내용은 현재 브라우저 세션에서만 유지됩니다. 로그아웃·세션 만료·서버 재시작 시 사라질 수 있습니다. 여러 고객 정보는 반드시 별칭으로 구분하고, 고객데이터 적용 전 사내 승인 절차를 확인하세요.')
+    st.info('저장 버튼은 **엑셀 파일을 PC로 다운로드**합니다. 서버에 자동 영구저장되지는 않으므로 로그아웃 전 저장 여부를 확인하세요. 고객 실명·계좌번호 등 식별정보를 입력하지 말고 사내 승인 정책을 준수하세요.')
 
 
 # ---- Dashboard charts: readable even with many holdings and a narrow sidebar. ----
