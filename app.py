@@ -13,8 +13,191 @@ import plotly.express as px
 import plotly.graph_objects as go
 from core import COLUMNS,normalize_portfolio,enrich_positions,portfolio_summary,risk_findings,build_individual_note,to_csv_bytes
 from services import fetch_history_batch,fetch_fx_krw_per_usd,fetch_google_news,fetch_news_batch
-from manual_entry import MANUAL_COLUMNS, blank_manual_rows, parse_manual_rows, current_to_manual_rows
-from portfolio_input import parse_portfolio_file,add_customer_cash,CASH_CODE
+
+
+
+# ---- Included inline to prevent Streamlit Cloud missing-module crashes ----
+import re
+
+CASH_CODE = 'HANAV_CASH_KRW'
+
+COLUMN_ALIASES = {
+    '평균단가':'매입단가', '평균매입단가':'매입단가', '평균매수가':'매입단가',
+    '현금잔고':'현금', '원화현금':'현금', '예수금':'현금',
+}
+
+def _canonical(column):
+    raw=str(column).strip()
+    compact=re.sub(r'[\s_]+','',raw)
+    return COLUMN_ALIASES.get(compact, raw)
+
+def _number(value):
+    if pd.isna(value) or str(value).strip()=='':
+        return None
+    v=str(value).strip().replace(',','').replace('원','').replace('₩','')
+    try:
+        n=float(v)
+    except (TypeError,ValueError) as exc:
+        raise ValueError(f'현금은 숫자로 입력하세요: {value!r}') from exc
+    if not math.isfinite(n) or n<0:
+        raise ValueError(f'현금은 0 이상의 유효한 금액이어야 합니다: {value!r}')
+    return n
+
+def parse_portfolio_file(frame: pd.DataFrame):
+    """Return stock rows for core, customer cash totals, and import warnings.
+
+    Repeated equal cash amounts per customer are interpreted as one customer
+    balance (never summed); conflicting balances are rejected.
+    """
+    if frame is None or frame.empty:
+        raise ValueError('입력된 데이터가 없습니다.')
+    df=frame.copy()
+    df.columns=[_canonical(c) for c in df.columns]
+    if df.columns.duplicated().any():
+        raise ValueError('평균단가/매입단가 등 같은 의미의 열이 중복되어 있습니다.')
+    df=df.dropna(how='all')
+    if df.empty:
+        raise ValueError('실제 데이터 행을 입력해 주세요.')
+    if '고객구분' not in df:
+        for alias in ('고객','고객명','계좌구분','계좌별칭'):
+            if alias in df:
+                df=df.rename(columns={alias:'고객구분'})
+                break
+    if '고객구분' not in df:
+        df['고객구분']='고객 A'
+    df['고객구분']=df['고객구분'].fillna('고객 A').astype(str).str.strip()
+    df.loc[df['고객구분'].isin(['','nan','None']),'고객구분']='고객 A'
+    cash={}
+    if '현금' in df:
+        for cust,g in df.groupby('고객구분',sort=False):
+            amounts={round(n,8) for n in (_number(v) for v in g['현금']) if n is not None}
+            if len(amounts)>1:
+                raise ValueError(f'고객구분 {cust}: 현금 금액이 서로 다릅니다. 고객별 현금잔고 하나만 입력해 주세요.')
+            if amounts:
+                cash[cust]=float(next(iter(amounts)))
+    # Keep cash-only rows out of security normalization.
+    code_field=next((c for c in ('종목코드','코드','ticker','symbol','티커','단축코드') if c in df),None)
+    if code_field is None:
+        raise ValueError('필수 열 누락: 종목코드')
+    valid=df[code_field].notna() & df[code_field].astype(str).str.strip().ne('')
+    stocks=df.loc[valid].drop(columns=['현금'],errors='ignore').copy()
+    if stocks.empty:
+        raise ValueError('유효한 보유종목이 없습니다. 현금만 있는 파일은 현재 버전에서 분석할 수 없습니다.')
+    normalized,warnings=normalize_portfolio(stocks)
+    # All six fields are enough for an upload; pricing comes from public quotes.
+    simplified=set(('고객구분','종목코드','종목명','보유수량','매입단가','현금')).issuperset(set(df.columns))
+    return normalized[COLUMNS].copy(), cash, warnings, simplified
+
+def add_customer_cash(stock_positions:pd.DataFrame,cash_by_customer:dict,fx:float|None):
+    """Append cash as explicitly identified KRW asset for allocation, not as equity.
+
+    Stock results remain separate for research/news; cash is treated as 0% P/L.
+    """
+    rows=[]
+    for cust,amount in cash_by_customer.items():
+        if not amount or amount<=0:
+            continue
+        row={c:None for c in COLUMNS}
+        row.update({'고객구분':cust,'종목코드':CASH_CODE,'종목명':'현금 (원화)',
+                    '시장':'CASH','통화':'KRW','보유수량':1.0,
+                    '매입단가':amount,'기준가':amount,'업종':'현금',
+                    '종목유형':'현금','비고':'고객별 현금잔고 · 시세 조회 제외'})
+        row['티커']=CASH_CODE
+        rows.append(row)
+    if not rows:
+        return stock_positions.copy()
+    cash_df=enrich_positions(pd.DataFrame(rows),{},fx)
+    cash_df['가격출처']='엑셀 입력 현금잔고'
+    cash_df['가격기준일']='사용자 입력'
+    assets=pd.concat([stock_positions,cash_df],ignore_index=True)
+    total=assets['평가액(원)'].sum(min_count=1)
+    assets['평가액비중(%)']=assets['평가액(원)']/total*100 if pd.notna(total) and total>0 else np.nan
+    return assets
+
+MANUAL_COLUMNS = ['고객구분', '종목코드', '종목명', '보유수량', '평균단가', '현금']
+
+def blank_manual_rows(count: int = 3) -> pd.DataFrame:
+    return pd.DataFrame({
+        '고객구분': pd.Series([None] * count, dtype='object'),
+        '종목코드': pd.Series([None] * count, dtype='object'),
+        '종목명': pd.Series([None] * count, dtype='object'),
+        '보유수량': pd.Series([float('nan')] * count, dtype='float64'),
+        '평균단가': pd.Series([float('nan')] * count, dtype='float64'),
+        '현금': pd.Series([float('nan')] * count, dtype='float64'),
+    })
+
+def _text(value) -> str:
+    if pd.isna(value):
+        return ''
+    return str(value).strip()
+
+def parse_manual_rows(rows: pd.DataFrame):
+    """Validate direct entry and return the existing common normalized import tuple.
+
+    Requiring an explicit customer alias prevents accidentally merging entries for
+    different clients under core's fallback '고객 A' label.
+    """
+    if rows is None or not isinstance(rows, pd.DataFrame):
+        raise ValueError('입력할 표가 없습니다.')
+    missing = [c for c in MANUAL_COLUMNS if c not in rows.columns]
+    if missing:
+        raise ValueError('입력 열 누락: ' + ', '.join(missing))
+    data = rows[MANUAL_COLUMNS].copy()
+    meaningful = []
+    for i, row in data.iterrows():
+        code = _text(row['종목코드'])
+        cash = _text(row['현금'])
+        # A row with a code or cash is an actual data row. Stock names typed
+        # without codes must not be silently ignored.
+        active = bool(code or cash or _text(row['종목명']) or
+                      _text(row['보유수량']) or _text(row['평균단가']))
+        if not active:
+            continue
+        if not _text(row['고객구분']):
+            raise ValueError(f'{i+1}번째 행: 고객구분(별칭)을 입력해 주세요.')
+        if not code and (_text(row['종목명']) or _text(row['보유수량']) or _text(row['평균단가'])):
+            raise ValueError(f'{i+1}번째 행: 보유종목 정보를 입력했다면 종목코드가 필요합니다.')
+        meaningful.append(i)
+    if not meaningful:
+        raise ValueError('고객구분·종목코드·수량 등을 입력한 후 반영해 주세요.')
+    data = data.loc[meaningful].reset_index(drop=True)
+    return parse_portfolio_file(data)
+
+def current_to_manual_rows(portfolio: pd.DataFrame, cash: dict) -> pd.DataFrame:
+    """Seed the six-column editor with current portfolio, showing cash once/client."""
+    if portfolio is None or portfolio.empty:
+        return blank_manual_rows()
+    result = []
+    cash_seen = set()
+    for _, p in portfolio.iterrows():
+        client = _text(p.get('고객구분')) or '고객 A'
+        code = _text(p.get('종목코드'))
+        # Explicit Yahoo suffix is used for KOSDAQ so that six columns suffice.
+        market = _text(p.get('시장')).upper()
+        if code.isdigit() and market in {'KOSDAQ', 'KQ', '코스닥'}:
+            code = code.zfill(6) + '.KQ'
+        rec = {
+            '고객구분': client,
+            '종목코드': code,
+            '종목명': _text(p.get('종목명')),
+            '보유수량': p.get('보유수량'),
+            '평균단가': p.get('매입단가'),
+            '현금': None,
+        }
+        if client in cash and client not in cash_seen:
+            rec['현금'] = cash[client]
+            cash_seen.add(client)
+        result.append(rec)
+    # Add cash-only rows for other clients; cannot be applied alone without stocks.
+    for client, amount in cash.items():
+        if client not in cash_seen:
+            result.append({'고객구분':client, '종목코드':None, '종목명':None,
+                           '보유수량':None, '평균단가':None, '현금':amount})
+    out = pd.DataFrame(result, columns=MANUAL_COLUMNS)
+    for col in ('보유수량', '평균단가', '현금'):
+        out[col] = pd.to_numeric(out[col], errors='coerce')
+    return out
+# ---- End built-in direct-entry and six-column import helpers ----
 
 st.set_page_config(page_title='HanaV Private Portfolio',page_icon='💠',layout='wide',initial_sidebar_state='expanded')
 st.markdown('''<style>
@@ -1304,7 +1487,7 @@ with tab_report:
         st.warning('실적·컨센서스·뉴스 자료가 0건입니다. 지금 PDF를 만들면 평가액과 가격추세 중심의 요약만 나타납니다. ②·③ 자료 수집을 먼저 권장합니다.')
     if st.button('④ 📄 시각형 포트폴리오 PDF 생성',type='primary'):
         try:
-            from pdf_report import build_pdf  # PDF 기능을 사용할 때만 의존성 로드
+            from pdf_report import build_pdf  # 전체 ZIP의 pdf_report.py 사용
             st.session_state['pdf_bytes']=build_pdf(asset_positions,price_mode,fx_source,st.session_state['is_demo'],
                             research_map=st.session_state.get('deep_research',{}),
                             news_map=st.session_state.get('news_map',{}),
@@ -1325,4 +1508,4 @@ with tab_report:
     st.markdown('• 데이터 제공사의 라이선스 및 대외 재배포 가능 여부  \n• 고객정보 처리 및 전산 보안 승인 여부  \n• 목표가·증권사 의견 인용의 적법성 및 근거 출처  \n• 고객 제공자료의 준법 검토 및 버전 이력 관리')
 
 st.divider()
-st.caption('HanaV Private Portfolio V1.0.12 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
+st.caption('HanaV Private Portfolio V1.0.14 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
