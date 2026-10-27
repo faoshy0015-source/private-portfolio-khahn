@@ -15,6 +15,39 @@ from core import COLUMNS,normalize_portfolio,enrich_positions,portfolio_summary,
 from services import fetch_history_batch,fetch_fx_krw_per_usd,fetch_google_news,fetch_news_batch
 
 
+# 2026-10-27 V1.0.16: KR-listed alphanumeric codes must be valued in KRW.
+# Example: 0015G0.KQ (그린광학). Legacy core.py recognizes only all-digit
+# Korean codes as KRW and otherwise silently assigns USD, multiplying value
+# by USD/KRW. This adapter works with the existing GitHub core.py unchanged.
+import re as _kr_currency_re
+_core_normalize_portfolio = normalize_portfolio
+
+def normalize_portfolio(data):
+    parsed, warnings = _core_normalize_portfolio(data)
+    ticker = parsed['티커'].astype(str).str.upper().str.strip()
+    code = parsed['종목코드'].astype(str).str.upper().str.strip()
+    # .KS/.KQ suffix: Korean-listed securities, including letters in new codes.
+    is_korean = ticker.str.fullmatch(r'[0-9A-Z]{6}\.K[QS]', na=False)
+    wrong_currency = is_korean & parsed['통화'].astype(str).str.upper().ne('KRW')
+    if wrong_currency.any():
+        examples = ', '.join(code[wrong_currency].unique()[:6])
+        parsed.loc[wrong_currency, '통화'] = 'KRW'
+        warnings = list(warnings) + [
+            f'국내 상장종목 {int(wrong_currency.sum())}건({examples})의 통화를 KRW로 교정했습니다. 기존 USD 적용 평가액은 사용하지 마세요.'
+        ]
+    # Without a market suffix, numeric-letter mixed Korean codes cannot be
+    # unambiguously recognized; prevent silent USD valuation.
+    suffix_missing = code.str.fullmatch(r'[0-9]{2}[0-9A-Z]{4}', na=False) & code.str.contains(r'[A-Z]', regex=True)
+    if suffix_missing.any():
+        entries = ', '.join(code[suffix_missing].unique()[:6])
+        raise ValueError(
+            f'국내 영숫자 종목코드({entries})에 거래소 구분이 없습니다. '
+            '코스닥은 .KQ, 코스피는 .KS를 붙여 주세요. 환율 오적용을 방지하기 위해 분석을 중단했습니다.'
+        )
+    return parsed, list(dict.fromkeys(warnings))
+
+
+
 
 # ---- Included inline to prevent Streamlit Cloud missing-module crashes ----
 import re
@@ -1140,7 +1173,14 @@ asset_positions=add_customer_cash(positions,cash_scope,fx)
 # Re-weight equity positions against equity+cash (not equities alone).
 if len(asset_positions)>len(positions):
     positions=asset_positions.iloc[:len(positions)].copy()
+# Clear stale report outputs generated before the currency correction.
+if st.session_state.get('_kr_currency_fix_version') != 'V1.0.16':
+    st.session_state.pop('pdf_bytes', None)
+    st.session_state['_kr_currency_fix_version'] = 'V1.0.16'
 summary=portfolio_summary(asset_positions)
+# Visible sanity note: never multiply domestic .KQ/.KS prices by the USD exchange rate.
+if normalized['티커'].astype(str).str.fullmatch(r'[0-9A-Z]{6}\.K[QS]', na=False).any():
+    st.caption('환산 검증: 국내 .KS/.KQ 보유종목은 영숫자 종목코드도 KRW로 평가하며, 미국 USD 자산에만 달러 환율을 적용합니다.')
 warns=warnings[:] + st.session_state.get('upload_warnings',[])
 if price_mode=='입력 기준가':warns.append('가격은 입력 기준가입니다. 입력일이 확인되지 않으므로 실시간 가격으로 간주하면 안 됩니다.')
 for w in warns[:5]:st.caption('ⓘ '+w)
@@ -1685,4 +1725,4 @@ with tab_report:
     st.markdown('• 데이터 제공사의 라이선스 및 대외 재배포 가능 여부  \n• 고객정보 처리 및 전산 보안 승인 여부  \n• 목표가·증권사 의견 인용의 적법성 및 근거 출처  \n• 고객 제공자료의 준법 검토 및 버전 이력 관리')
 
 st.divider()
-st.caption('HanaV Private Portfolio V1.0.14 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
+st.caption('HanaV Private Portfolio V1.0.16 · 기존 HanaV Trading과 별개인 내부 시험용 도구 · 주문/자동매매/개인정보 서버저장 미지원')
