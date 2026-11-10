@@ -376,6 +376,9 @@ def manual_draft_from_excel(excel_bytes: bytes) -> pd.DataFrame:
 # ---- End built-in direct-entry and six-column import helpers ----
 
 st.set_page_config(page_title='HanaV Private Portfolio',page_icon='💠',layout='wide',initial_sidebar_state='expanded')
+
+from email_access import require_approved_email
+require_approved_email(st)
 st.markdown('''<style>
 /* HanaV Private Portfolio V1.0.15 — draft save and resume.
    This visual layer intentionally works even if GitHub retains the old dark
