@@ -376,6 +376,11 @@ def manual_draft_from_excel(excel_bytes: bytes) -> pd.DataFrame:
 # ---- End built-in direct-entry and six-column import helpers ----
 
 st.set_page_config(page_title='HanaV Private Portfolio',page_icon='💠',layout='wide',initial_sidebar_state='expanded')
+# When EMAIL_ACCESS_MODE=enforced, verify Supabase Auth identity and central
+# approved email grant before the existing APP_PASSWORD / app data access.
+from approved_email_gate import require_approved_email
+require_approved_email(st, "private-portfolio", "HanaV Private Portfolio")
+
 st.markdown('''<style>
 /* HanaV Private Portfolio V1.0.15 — draft save and resume.
    This visual layer intentionally works even if GitHub retains the old dark
